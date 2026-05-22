@@ -8,7 +8,6 @@ import websocket
 
 from functools import wraps
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from telebot.formatting import escape_markdown
 
 # ================= CONFIG =================
 
@@ -17,12 +16,12 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 ALERTS_FILE = "alerts.json"
 CACHE_TTL = 10
-MAX_HISTORY = 3
+MAX_HISTORY = 3          # Keep only last 3 result messages
 COOLDOWN_SECONDS = 2
 
 PRICE_CACHE = {}
 waiting_for = {}
-user_msg_history = {}
+user_msg_history = {}    # Only tracks result messages (not menu edits)
 cooldowns = {}
 ws_restart_required = False
 lock = threading.Lock()
@@ -50,17 +49,10 @@ def save_alerts():
     except Exception as e:
         print(f"[SAVE ALERTS ERROR] {e}")
 
-# ================= UTILITIES =================
-
-def cooldown_ok(user_id):
-    now = time.time()
-    if user_id in cooldowns:
-        if now - cooldowns[user_id] < COOLDOWN_SECONDS:
-            return False
-    cooldowns[user_id] = now
-    return True
+# ================= MESSAGE CLEANUP (only for result messages) =================
 
 def cleanup_old_messages(chat_id):
+    """Delete oldest result messages if exceeding MAX_HISTORY."""
     if chat_id not in user_msg_history:
         return
     history = user_msg_history[chat_id]
@@ -71,24 +63,24 @@ def cleanup_old_messages(chat_id):
         except Exception:
             pass
 
-def safe_send(chat_id, text, reply_markup=None):
-    try:
-        sent = bot.send_message(chat_id, text, reply_markup=reply_markup)
-        if chat_id not in user_msg_history:
-            user_msg_history[chat_id] = []
-        user_msg_history[chat_id].append(sent.message_id)
-        cleanup_old_messages(chat_id)
-        return sent
-    except Exception as e:
-        print(f"[SEND ERROR] {e}")
+def send_result(chat_id, text, reply_markup=None):
+    """Send a result message and manage history (keep last MAX_HISTORY)."""
+    sent = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="Markdown")
+    if chat_id not in user_msg_history:
+        user_msg_history[chat_id] = []
+    user_msg_history[chat_id].append(sent.message_id)
+    cleanup_old_messages(chat_id)
+    return sent
 
-def safe_edit(chat_id, message_id, text, reply_markup=None):
-    try:
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
-    except Exception as e:
-        if "message is not modified" not in str(e):
-            print(f"[EDIT ERROR] {e}")
-            safe_send(chat_id, text, reply_markup)
+# ================= UTILITIES =================
+
+def cooldown_ok(user_id):
+    now = time.time()
+    if user_id in cooldowns:
+        if now - cooldowns[user_id] < COOLDOWN_SECONDS:
+            return False
+    cooldowns[user_id] = now
+    return True
 
 def retry(max_retries=3, delay=1):
     def decorator(func):
@@ -105,7 +97,7 @@ def retry(max_retries=3, delay=1):
         return wrapper
     return decorator
 
-# ================= API (Full) =================
+# ================= API (same as before) =================
 
 @retry()
 def get_price(symbol):
@@ -222,7 +214,7 @@ def scan_ca(address):
         pass
     return None
 
-# ================= WEBSOCKET =================
+# ================= WEBSOCKET (unchanged) =================
 
 current_ws = None
 
@@ -307,6 +299,7 @@ def check_alerts():
                 for a, price in triggered:
                     label = "🚀 risen above" if a["direction"] == ">" else "📉 dropped below"
                     try:
+                        # Alert messages are NOT tracked (they stay forever)
                         bot.send_message(
                             a["chat_id"],
                             f"🔔 *Alert #{a['id']} triggered!*\n\n"
@@ -339,7 +332,7 @@ def memory_cleaner():
 
 threading.Thread(target=memory_cleaner, daemon=True).start()
 
-# ================= KEYBOARDS (Full) =================
+# ================= KEYBOARDS (same as before) =================
 
 def main_menu():
     kb = InlineKeyboardMarkup()
@@ -437,34 +430,21 @@ def multi_coins_menu():
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
-# ================= STREAMING PRICE =================
-
-def stream_price_update(chat_id, symbol):
-    sent = bot.send_message(chat_id, f"⏳ Fetching {symbol} price...", parse_mode="Markdown")
-    if chat_id not in user_msg_history:
-        user_msg_history[chat_id] = []
-    user_msg_history[chat_id].append(sent.message_id)
-    cleanup_old_messages(chat_id)
-
-    price, change = get_price(symbol)
-    if price is None:
-        safe_edit(chat_id, sent.message_id, f"❌ Could not fetch {symbol}. Please try again.")
-    else:
-        arrow = "🟢 ▲" if change >= 0 else "🔴 ▼"
-        safe_edit(chat_id, sent.message_id,
-                  f"*{symbol}*\n💵 ${price:,.4f}\n{arrow} {abs(change):.2f}% (24h)",
-                  reply_markup=price_menu())
-
-# ================= START =================
+# ================= START COMMAND =================
 
 @bot.message_handler(commands=["start", "help"])
 def start(msg):
-    safe_send(msg.chat.id, "🤖 *Persona* — your crypto assistant\n\nChoose an option:", reply_markup=main_menu())
+    bot.send_message(
+        msg.chat.id,
+        "🤖 *Persona* — your crypto assistant\n\nChoose an option:",
+        reply_markup=main_menu(),
+        parse_mode="Markdown"
+    )
 
-# ================= CALLBACKS (Full) =================
+# ================= CALLBACK HANDLER =================
 
 @bot.callback_query_handler(func=lambda call: True)
-def callbacks(call):
+def handle_callback(call):
     global alert_id_counter, ws_restart_required
     cid = call.message.chat.id
     mid = call.message.message_id
@@ -475,36 +455,104 @@ def callbacks(call):
         return
 
     try:
-        # ----- Navigation -----
+        # ---- Navigation: edit in place (no history tracking) ----
         if data == "back_main":
             waiting_for.pop(cid, None)
-            safe_edit(cid, mid, "🤖 *Persona* — your crypto assistant\n\nChoose an option:", reply_markup=main_menu())
+            bot.edit_message_text(
+                "🤖 *Persona* — your crypto assistant\n\nChoose an option:",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=main_menu()
+            )
             bot.answer_callback_query(call.id)
 
         elif data == "menu_price":
-            safe_edit(cid, mid, "💰 *Select a coin or search:*", reply_markup=price_menu())
+            bot.edit_message_text(
+                "💰 *Select a coin or search:*",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=price_menu()
+            )
             bot.answer_callback_query(call.id)
 
         elif data == "search_coin":
             waiting_for[cid] = "price"
-            safe_edit(cid, mid, "🔍 *Type any coin symbol:*\nExample: `PEPE`, `WIF`, `SEI`", reply_markup=back_button())
+            bot.edit_message_text(
+                "🔍 *Type any coin symbol:*\nExample: `PEPE`, `WIF`, `SEI`",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=back_button()
+            )
             bot.answer_callback_query(call.id)
 
-        elif data.startswith("price_"):
-            symbol = data.split("_")[1]
-            bot.answer_callback_query(call.id, f"Fetching {symbol}...")
-            stream_price_update(cid, symbol)
-
-        # ----- Alerts Menu -----
         elif data == "menu_alerts":
-            safe_edit(cid, mid, "🔔 *Quick Alerts* — tap to set or create custom:", reply_markup=alerts_menu())
+            bot.edit_message_text(
+                "🔔 *Quick Alerts* — tap to set or create custom:",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=alerts_menu()
+            )
             bot.answer_callback_query(call.id)
 
         elif data == "custom_alert":
             waiting_for[cid] = "alert"
-            safe_edit(cid, mid, "✏️ *Type your custom alert:*\nFormat: `COIN > price` or `COIN < price`\n\nExamples:\n`BTC > 95000`\n`PEPE < 0.00001`", reply_markup=back_button())
+            bot.edit_message_text(
+                "✏️ *Type your custom alert:*\nFormat: `COIN > price` or `COIN < price`\n\nExamples:\n`BTC > 95000`\n`PEPE < 0.00001`",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=back_button()
+            )
             bot.answer_callback_query(call.id)
 
+        elif data == "menu_info":
+            bot.edit_message_text(
+                "🔎 *Coin Info — Select or search:*",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=info_coins_menu()
+            )
+            bot.answer_callback_query(call.id)
+
+        elif data == "search_info":
+            waiting_for[cid] = "info"
+            bot.edit_message_text(
+                "🔍 *Type any coin symbol:*\nExample: `PEPE`, `WIF`",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=back_button()
+            )
+            bot.answer_callback_query(call.id)
+
+        elif data == "menu_multi":
+            bot.edit_message_text(
+                "💱 *Multi-Currency Price — Select or search:*",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=multi_coins_menu()
+            )
+            bot.answer_callback_query(call.id)
+
+        elif data == "search_multi":
+            waiting_for[cid] = "multi"
+            bot.edit_message_text(
+                "🔍 *Type any coin symbol:*\nExample: `BTC`, `ETH`",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=back_button()
+            )
+            bot.answer_callback_query(call.id)
+
+        elif data == "menu_scan":
+            waiting_for[cid] = "scan"
+            bot.edit_message_text(
+                "🛡 *CA Scanner*\n\nPaste a contract address:\n✅ Supports ETH, BSC, Solana\n\nExample:\n`0x1234...abcd`",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=back_button()
+            )
+            bot.answer_callback_query(call.id)
+
+        # ---- Set Alert (preset) ----
         elif data.startswith("setalert_"):
             parts = data.split("_")
             symbol = parts[1]
@@ -523,15 +571,24 @@ def callbacks(call):
                 alert_id_counter += 1
             save_alerts()
             ws_restart_required = True
+            bot.edit_message_text(
+                f"✅ Alert #{current_id} set!\n*{symbol}* {direction} *${target:,.2f}*",
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=alerts_menu()
+            )
             bot.answer_callback_query(call.id, "✅ Alert set!")
-            safe_edit(cid, mid, f"🔔 Alert #{current_id} set!\n*{symbol}* {direction} *${target:,.2f}*", reply_markup=alerts_menu())
 
-        # ----- List & Cancel Alerts -----
+        # ---- List Alerts (edit in place) ----
         elif data == "list_alerts":
             active = [a for a in alerts if a["chat_id"] == cid and a["active"]]
             if not active:
                 bot.answer_callback_query(call.id, "No active alerts.")
-                safe_edit(cid, mid, "📋 No active alerts.\n\nSet one below:", reply_markup=alerts_menu())
+                bot.edit_message_text(
+                    "📋 No active alerts.\n\nSet one below:",
+                    cid, mid,
+                    reply_markup=alerts_menu()
+                )
                 return
             text = "📋 *Active Alerts:*\n\n"
             kb = InlineKeyboardMarkup()
@@ -540,9 +597,15 @@ def callbacks(call):
                 text += f"#{a['id']} — {a['coin']} {label} ${a['target']:,.2f}\n"
                 kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
             kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-            safe_edit(cid, mid, text, reply_markup=kb)
+            bot.edit_message_text(
+                text,
+                cid, mid,
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
             bot.answer_callback_query(call.id)
 
+        # ---- Cancel Alert (edit in place) ----
         elif data.startswith("cancel_"):
             aid = int(data.split("_")[1])
             with lock:
@@ -556,7 +619,11 @@ def callbacks(call):
             # Refresh list
             active = [a for a in alerts if a['chat_id'] == cid and a['active']]
             if not active:
-                safe_edit(cid, mid, "📋 No more active alerts.", reply_markup=back_button())
+                bot.edit_message_text(
+                    "📋 No more active alerts.",
+                    cid, mid,
+                    reply_markup=back_button()
+                )
             else:
                 text = "📋 *Active Alerts:*\n\n"
                 kb = InlineKeyboardMarkup()
@@ -565,79 +632,83 @@ def callbacks(call):
                     text += f"#{a['id']} — {a['coin']} {label} ${a['target']:,.2f}\n"
                     kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
                 kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-                safe_edit(cid, mid, text, reply_markup=kb)
+                bot.edit_message_text(
+                    text,
+                    cid, mid,
+                    parse_mode="Markdown",
+                    reply_markup=kb
+                )
 
-        # ----- Gainers / Losers -----
+        # ---- Price button (send as result, tracked) ----
+        elif data.startswith("price_"):
+            symbol = data.split("_")[1]
+            bot.answer_callback_query(call.id, f"Fetching {symbol}...")
+            price, change = get_price(symbol)
+            if price is None:
+                send_result(cid, f"❌ Could not fetch *{symbol}*.", reply_markup=price_menu())
+            else:
+                arrow = "🟢 ▲" if change >= 0 else "🔴 ▼"
+                send_result(
+                    cid,
+                    f"*{symbol}*\n💵 ${price:,.4f}\n{arrow} {abs(change):.2f}% (24h)",
+                    reply_markup=price_menu()
+                )
+
+        # ---- Gainers / Losers (send as result, tracked) ----
         elif data == "gainers":
             bot.answer_callback_query(call.id, "Fetching top gainers...")
             g, _ = get_top_movers()
             if not g:
-                safe_edit(cid, mid, "❌ Failed to fetch.", reply_markup=back_button())
+                send_result(cid, "❌ Failed to fetch.", reply_markup=back_button())
             else:
                 text = "🚀 *Top 5 Gainers (24h)*\n\n"
                 for d in g:
                     coin = d["symbol"].replace("USDT", "")
                     text += f"🟢 *{coin}* — ${float(d['lastPrice']):,.4f} ▲ {float(d['priceChangePercent']):.2f}%\n"
-                safe_edit(cid, mid, text, reply_markup=back_button())
+                send_result(cid, text, reply_markup=back_button())
 
         elif data == "losers":
             bot.answer_callback_query(call.id, "Fetching top losers...")
             _, l = get_top_movers()
             if not l:
-                safe_edit(cid, mid, "❌ Failed to fetch.", reply_markup=back_button())
+                send_result(cid, "❌ Failed to fetch.", reply_markup=back_button())
             else:
                 text = "📉 *Top 5 Losers (24h)*\n\n"
                 for d in l:
                     coin = d["symbol"].replace("USDT", "")
                     text += f"🔴 *{coin}* — ${float(d['lastPrice']):,.4f} ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
-                safe_edit(cid, mid, text, reply_markup=back_button())
+                send_result(cid, text, reply_markup=back_button())
 
-        # ----- Coin Info -----
-        elif data == "menu_info":
-            safe_edit(cid, mid, "🔎 *Coin Info — Select or search:*", reply_markup=info_coins_menu())
-            bot.answer_callback_query(call.id)
-
-        elif data == "search_info":
-            waiting_for[cid] = "info"
-            safe_edit(cid, mid, "🔍 *Type any coin symbol:*\nExample: `PEPE`, `WIF`", reply_markup=back_button())
-            bot.answer_callback_query(call.id)
-
+        # ---- Coin Info (send as result, tracked) ----
         elif data.startswith("info_"):
             symbol = data.split("_")[1]
             bot.answer_callback_query(call.id, f"Fetching {symbol} info...")
             info = get_coin_info(symbol)
             if not info:
-                safe_edit(cid, mid, f"❌ Couldn't fetch info for *{symbol}*.", reply_markup=info_coins_menu())
+                send_result(cid, f"❌ Couldn't fetch info for *{symbol}*.", reply_markup=info_coins_menu())
             else:
                 supply_str = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
                 max_str = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
-                safe_edit(cid, mid,
-                          f"🔎 *{info['name']} ({info['symbol']})*\n\n"
-                          f"🏆 Rank: #{info['rank']}\n"
-                          f"💵 Price: ${info['price']:,.4f}\n"
-                          f"📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n"
-                          f"📉 From ATH: {info['ath_change']:.2f}%\n"
-                          f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
-                          f"📊 Volume 24h: ${info['volume']:,.0f}\n"
-                          f"🔄 Supply: {supply_str} / {max_str}",
-                          reply_markup=info_coins_menu())
+                send_result(
+                    cid,
+                    f"🔎 *{info['name']} ({info['symbol']})*\n\n"
+                    f"🏆 Rank: #{info['rank']}\n"
+                    f"💵 Price: ${info['price']:,.4f}\n"
+                    f"📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n"
+                    f"📉 From ATH: {info['ath_change']:.2f}%\n"
+                    f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
+                    f"📊 Volume 24h: ${info['volume']:,.0f}\n"
+                    f"🔄 Supply: {supply_str} / {max_str}",
+                    reply_markup=info_coins_menu()
+                )
 
-        # ----- Multi Price -----
-        elif data == "menu_multi":
-            safe_edit(cid, mid, "💱 *Multi-Currency Price — Select or search:*", reply_markup=multi_coins_menu())
-            bot.answer_callback_query(call.id)
-
-        elif data == "search_multi":
-            waiting_for[cid] = "multi"
-            safe_edit(cid, mid, "🔍 *Type any coin symbol:*\nExample: `BTC`, `ETH`", reply_markup=back_button())
-            bot.answer_callback_query(call.id)
-
+        # ---- Multi Price (send as result, tracked) ----
         elif data.startswith("multi_"):
             symbol = data.split("_")[1]
             bot.answer_callback_query(call.id, f"Fetching {symbol} prices...")
             prices = get_multi_price(symbol)
             if not prices:
-                safe_edit(cid, mid, f"❌ Couldn't fetch *{symbol}*.", reply_markup=multi_coins_menu())
+                send_result(cid, f"❌ Couldn't fetch *{symbol}*.", reply_markup=multi_coins_menu())
             else:
                 flags = {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £", "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ", "try": "🇹🇷 ₺"}
                 text = f"💱 *{symbol} Price*\n\n"
@@ -645,20 +716,12 @@ def callbacks(call):
                     p = prices.get(cur)
                     if p:
                         text += f"{flag} {p:,.4f}\n"
-                safe_edit(cid, mid, text, reply_markup=multi_coins_menu())
-
-        # ----- CA Scanner -----
-        elif data == "menu_scan":
-            waiting_for[cid] = "scan"
-            safe_edit(cid, mid,
-                      "🛡 *CA Scanner*\n\nPaste a contract address:\n✅ Supports ETH, BSC, Solana\n\nExample:\n`0x1234...abcd`",
-                      reply_markup=back_button())
-            bot.answer_callback_query(call.id)
+                send_result(cid, text, reply_markup=multi_coins_menu())
 
     except Exception as e:
         print(f"[CALLBACK ERROR] {e}")
 
-# ================= TEXT HANDLER =================
+# ================= TEXT HANDLER (user typed input) =================
 
 @bot.message_handler(func=lambda msg: True)
 def text_handler(msg):
@@ -671,32 +734,44 @@ def text_handler(msg):
 
     try:
         if mode == "price":
-            stream_price_update(cid, text.upper())
+            symbol = text.upper()
+            price, change = get_price(symbol)
+            if price is None:
+                send_result(cid, f"❌ Could not fetch *{symbol}*.", reply_markup=price_menu())
+            else:
+                arrow = "🟢 ▲" if change >= 0 else "🔴 ▼"
+                send_result(
+                    cid,
+                    f"*{symbol}*\n💵 ${price:,.4f}\n{arrow} {abs(change):.2f}% (24h)",
+                    reply_markup=price_menu()
+                )
 
         elif mode == "info":
             symbol = text.upper()
             info = get_coin_info(symbol)
             if not info:
-                safe_send(cid, f"❌ *{symbol}* not found.", reply_markup=info_coins_menu())
+                send_result(cid, f"❌ *{symbol}* not found.", reply_markup=info_coins_menu())
             else:
                 supply_str = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
                 max_str = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
-                safe_send(cid,
-                          f"🔎 *{info['name']} ({info['symbol']})*\n\n"
-                          f"🏆 Rank: #{info['rank']}\n"
-                          f"💵 Price: ${info['price']:,.4f}\n"
-                          f"📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n"
-                          f"📉 From ATH: {info['ath_change']:.2f}%\n"
-                          f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
-                          f"📊 Volume 24h: ${info['volume']:,.0f}\n"
-                          f"🔄 Supply: {supply_str} / {max_str}",
-                          reply_markup=info_coins_menu())
+                send_result(
+                    cid,
+                    f"🔎 *{info['name']} ({info['symbol']})*\n\n"
+                    f"🏆 Rank: #{info['rank']}\n"
+                    f"💵 Price: ${info['price']:,.4f}\n"
+                    f"📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n"
+                    f"📉 From ATH: {info['ath_change']:.2f}%\n"
+                    f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
+                    f"📊 Volume 24h: ${info['volume']:,.0f}\n"
+                    f"🔄 Supply: {supply_str} / {max_str}",
+                    reply_markup=info_coins_menu()
+                )
 
         elif mode == "multi":
             symbol = text.upper()
             prices = get_multi_price(symbol)
             if not prices:
-                safe_send(cid, f"❌ *{symbol}* not found.", reply_markup=multi_coins_menu())
+                send_result(cid, f"❌ *{symbol}* not found.", reply_markup=multi_coins_menu())
             else:
                 flags = {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £", "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ", "try": "🇹🇷 ₺"}
                 text_out = f"💱 *{symbol} Price*\n\n"
@@ -704,12 +779,12 @@ def text_handler(msg):
                     p = prices.get(cur)
                     if p:
                         text_out += f"{flag} {p:,.4f}\n"
-                safe_send(cid, text_out, reply_markup=multi_coins_menu())
+                send_result(cid, text_out, reply_markup=multi_coins_menu())
 
         elif mode == "scan":
             result = scan_ca(text)
             if not result:
-                safe_send(cid, "❌ Contract not found or unsupported chain.\nSupports ETH, BSC, Solana.", reply_markup=back_button())
+                send_result(cid, "❌ Contract not found or unsupported chain.\nSupports ETH, BSC, Solana.", reply_markup=back_button())
             else:
                 name = result.get("token_name", "Unknown")
                 sym = result.get("token_symbol", "?")
@@ -726,21 +801,23 @@ def text_handler(msg):
                     if v == "0": return "✅ No"
                     return "❓ Unknown"
 
-                safe_send(cid,
-                          f"🛡 *CA Scan: {name} ({sym})*\n\n"
-                          f"🍯 Honeypot: {flag(hp)}\n"
-                          f"🖨 Mintable: {flag(mint)}\n"
-                          f"🔁 Proxy: {flag(proxy)}\n"
-                          f"📂 Open Source: {flag(open_source)}\n"
-                          f"💸 Buy Tax: {buy_tax}%\n"
-                          f"💸 Sell Tax: {sell_tax}%\n"
-                          f"👥 Holders: {holders}",
-                          reply_markup=back_button())
+                send_result(
+                    cid,
+                    f"🛡 *CA Scan: {name} ({sym})*\n\n"
+                    f"🍯 Honeypot: {flag(hp)}\n"
+                    f"🖨 Mintable: {flag(mint)}\n"
+                    f"🔁 Proxy: {flag(proxy)}\n"
+                    f"📂 Open Source: {flag(open_source)}\n"
+                    f"💸 Buy Tax: {buy_tax}%\n"
+                    f"💸 Sell Tax: {sell_tax}%\n"
+                    f"👥 Holders: {holders}",
+                    reply_markup=back_button()
+                )
 
         elif mode == "alert":
             parts = text.split()
             if len(parts) != 3 or parts[1] not in ['>', '<']:
-                safe_send(cid, "❌ Wrong format.\nUse: `BTC > 70000`", reply_markup=alerts_menu())
+                send_result(cid, "❌ Wrong format.\nUse: `BTC > 70000`", reply_markup=alerts_menu())
                 return
             symbol = parts[0].upper()
             direction = parts[1]
@@ -758,14 +835,14 @@ def text_handler(msg):
                 alert_id_counter += 1
             save_alerts()
             ws_restart_required = True
-            safe_send(cid, f"🔔 Alert #{current_id} set!\n*{symbol}* {direction} *${target:,.2f}*", reply_markup=alerts_menu())
+            send_result(cid, f"🔔 Alert #{current_id} set!\n*{symbol}* {direction} *${target:,.2f}*", reply_markup=alerts_menu())
 
     except Exception as e:
         print(f"[TEXT ERROR] {e}")
 
 # ================= POLLING =================
 
-print("🚀 Persona V5 (Full Edition) running...")
+print("🚀 Persona V5 — Last 3 result messages kept, menus edit in place, alerts stay forever")
 while True:
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
