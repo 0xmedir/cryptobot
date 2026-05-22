@@ -35,12 +35,6 @@ lock = threading.Lock()
 active_ws = None
 shutdown_flag = False
 
-# ================= ESCAPE MARKDOWN (parentheses allowed) =================
-def escape_md(text):
-    """Escape Telegram Markdown special characters, except parentheses."""
-    chars = r'_*[]~`>#+-=|{}.!'   # ( and ) are NOT escaped
-    return ''.join('\\' + c if c in chars else c for c in text)
-
 # ================= ATOMIC SAVE & LOGGING =================
 def log(msg, level="INFO"):
     print(f"[{level}] {time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}")
@@ -99,8 +93,8 @@ def cleanup_old_messages(chat_id):
             log(f"Failed to delete message {old_id}: {e}", "WARNING")
 
 def send_and_track(chat_id, text, reply_markup=None):
-    escaped_text = escape_md(text)
-    sent = bot.send_message(chat_id, escaped_text, reply_markup=reply_markup)
+    """Send a message without escaping (markdown will work)."""
+    sent = bot.send_message(chat_id, text, reply_markup=reply_markup)
     if chat_id not in user_msg_queue:
         user_msg_queue[chat_id] = []
     user_msg_queue[chat_id].append(sent.message_id)
@@ -789,7 +783,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # ================= START BOT =================
-log("🚀 Persona — Production ready with all fixes applied")
+log("🚀 Persona — Production ready, markdown works correctly")
 while not shutdown_flag:
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
