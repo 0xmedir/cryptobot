@@ -2,10 +2,11 @@ import telebot
 import requests
 import threading
 import time
+import os
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-import os
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8619003788:AAEszjzsxeKH8dSm8FPtqkPJxCG9Dw3Tne4")
+bot = telebot.TeleBot(BOT_TOKEN)
 
 alerts = []
 alert_id_counter = [1]
@@ -112,9 +113,7 @@ def get_multi_price(symbol):
 
 def scan_ca(address):
     try:
-        # Detect chain by address format
         if address.startswith("0x") and len(address) == 42:
-            # Try ETH first
             r = requests.get(
                 f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={address}",
                 timeout=10
@@ -122,7 +121,6 @@ def scan_ca(address):
             data = r.json()
             result = data.get("result", {}).get(address.lower(), {})
             if not result:
-                # Try BSC
                 r = requests.get(
                     f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={address}",
                     timeout=10
@@ -131,7 +129,6 @@ def scan_ca(address):
                 result = data.get("result", {}).get(address.lower(), {})
             return result
         else:
-            # Solana
             r = requests.get(
                 f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={address}",
                 timeout=10
@@ -360,12 +357,12 @@ def handle_text(msg):
                 update_main(cid, f"❌ *{symbol}* not found.", multi_coins_menu())
             else:
                 flags = {"usd": "🇺🇸", "eur": "🇪🇺", "gbp": "🇬🇧", "jpy": "🇯🇵", "cny": "🇨🇳", "aed": "🇦🇪", "try": "🇹🇷"}
-                symbols = {"usd": "$", "eur": "€", "gbp": "£", "jpy": "¥", "cny": "¥", "aed": "د.إ", "try": "₺"}
+                symbols_map = {"usd": "$", "eur": "€", "gbp": "£", "jpy": "¥", "cny": "¥", "aed": "د.إ", "try": "₺"}
                 text_out = f"💱 *{symbol} Price*\n\n"
                 for cur, flag in flags.items():
                     p = prices.get(cur)
                     if p:
-                        text_out += f"{flag} {symbols[cur]}{p:,.4f}\n"
+                        text_out += f"{flag} {symbols_map[cur]}{p:,.4f}\n"
                 update_main(cid, text_out, multi_coins_menu())
 
         elif mode == "scan":
@@ -613,12 +610,12 @@ def handle_callback(call):
             update_main(cid, f"❌ Couldn't fetch *{symbol}*.", multi_coins_menu())
         else:
             flags = {"usd": "🇺🇸", "eur": "🇪🇺", "gbp": "🇬🇧", "jpy": "🇯🇵", "cny": "🇨🇳", "aed": "🇦🇪", "try": "🇹🇷"}
-            symbols = {"usd": "$", "eur": "€", "gbp": "£", "jpy": "¥", "cny": "¥", "aed": "د.إ", "try": "₺"}
+            symbols_map = {"usd": "$", "eur": "€", "gbp": "£", "jpy": "¥", "cny": "¥", "aed": "د.إ", "try": "₺"}
             text = f"💱 *{symbol} Price*\n\n"
             for cur, flag in flags.items():
                 p = prices.get(cur)
                 if p:
-                    text += f"{flag} {symbols[cur]}{p:,.4f}\n"
+                    text += f"{flag} {symbols_map[cur]}{p:,.4f}\n"
             update_main(cid, text, multi_coins_menu())
 
     elif data == "menu_scan":
