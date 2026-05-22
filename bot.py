@@ -9,6 +9,8 @@ import random
 import signal
 import sys
 import re
+import csv
+from datetime import datetime
 from functools import wraps
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -18,6 +20,9 @@ if not BOT_TOKEN:
     print("❌ BOT_TOKEN environment variable not set. Exiting.")
     sys.exit(1)
 
+# Admin user IDs (your Telegram user ID)
+ADMIN_IDS = [7458428092]  # Your ID
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 ALERTS_FILE = "alerts.json"
 CACHE_TTL = 10
@@ -25,6 +30,7 @@ MAX_HISTORY = 3
 COOLDOWN_SECONDS = 2
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
+ANALYTICS_FILE = "analytics.csv"
 
 PRICE_CACHE = {}
 waiting_for = {}
@@ -34,6 +40,24 @@ ws_restart_required = False
 lock = threading.Lock()
 active_ws = None
 shutdown_flag = False
+
+# ================= USER TRACKING =================
+def init_analytics():
+    if not os.path.exists(ANALYTICS_FILE):
+        with open(ANALYTICS_FILE, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Timestamp', 'User ID', 'Username', 'First Name', 'Command', 'Details'])
+
+def log_interaction(user_id, username, first_name, command, details=""):
+    try:
+        with open(ANALYTICS_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([datetime.now().isoformat(), user_id, username or "?", first_name or "?", command, details])
+    except Exception as e:
+        print(f"Log error: {e}")
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
 # ================= ATOMIC SAVE & LOGGING =================
 def log(msg, level="INFO"):
@@ -168,11 +192,9 @@ def get_top_movers():
         log(f"get_top_movers error: {e}", "ERROR")
         return None, None
 
-# Improved get_coin_info with direct ID mapping and better caching
 @retry_with_backoff(max_retries=3, base_delay=2)
 def get_coin_info(symbol):
     symbol_up = symbol.upper()
-    # Cache for 1 hour
     if not hasattr(get_coin_info, "cache"):
         get_coin_info.cache = {}
     now = time.time()
@@ -181,7 +203,6 @@ def get_coin_info(symbol):
         if now - cached["timestamp"] < 3600:
             return cached["data"]
 
-    # Direct mapping for most popular coins (faster, avoids search)
     cg_id_map = {
         "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
         "SOL": "solana", "XRP": "ripple", "DOGE": "dogecoin",
@@ -194,7 +215,6 @@ def get_coin_info(symbol):
     }
     coin_id = cg_id_map.get(symbol_up)
     if not coin_id:
-        # Fallback to search
         try:
             r = session.get(f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}", timeout=10)
             if r.status_code == 200:
@@ -481,9 +501,77 @@ def multi_coins_menu():
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
+# ================= ADMIN COMMANDS =================
+@bot.message_handler(commands=["stats"])
+def stats_command(msg):
+    if not is_admin(msg.from_user.id):
+        send_and_track(msg.chat.id, "⛔ Admin only.")
+        return
+    log_interaction(msg.from_user.id, msg.from_user.username, msg.from_user.first_name, "/stats")
+    try:
+        if not os.path.exists(ANALYTICS_FILE):
+            send_and_track(msg.chat.id, "No analytics data yet.")
+            return
+        with open(ANALYTICS_FILE, 'r') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        if len(rows) <= 1:
+            send_and_track(msg.chat.id, "No user interactions logged.")
+            return
+        total_interactions = len(rows) - 1
+        unique_users = len(set(row[1] for row in rows[1:]))
+        cmd_counts = {}
+        for row in rows[1:]:
+            cmd = row[4]
+            cmd_counts[cmd] = cmd_counts.get(cmd, 0) + 1
+        most_used = max(cmd_counts.items(), key=lambda x: x[1]) if cmd_counts else ("None", 0)
+        stats_text = (
+            f"📊 *Bot Analytics*\n\n"
+            f"👥 Unique users: {unique_users}\n"
+            f"🔄 Total interactions: {total_interactions}\n"
+            f"🔥 Most used command: `{most_used[0]}` ({most_used[1]} times)"
+        )
+        send_and_track(msg.chat.id, stats_text)
+    except Exception as e:
+        send_and_track(msg.chat.id, f"Error reading analytics: {e}")
+
+@bot.message_handler(commands=["users"])
+def users_command(msg):
+    if not is_admin(msg.from_user.id):
+        send_and_track(msg.chat.id, "⛔ Admin only.")
+        return
+    log_interaction(msg.from_user.id, msg.from_user.username, msg.from_user.first_name, "/users")
+    try:
+        if not os.path.exists(ANALYTICS_FILE):
+            send_and_track(msg.chat.id, "No users yet.")
+            return
+        with open(ANALYTICS_FILE, 'r') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        if len(rows) <= 1:
+            send_and_track(msg.chat.id, "No users yet.")
+            return
+        users = {}
+        for row in rows[1:]:
+            uid = row[1]
+            username = row[2]
+            name = row[3]
+            if uid not in users:
+                users[uid] = (username, name)
+        if not users:
+            send_and_track(msg.chat.id, "No users.")
+            return
+        user_list = "\n".join([f"`{uid}` – {name} (@{username})" for uid, (username, name) in list(users.items())[:20]])
+        if len(users) > 20:
+            user_list += f"\n... and {len(users)-20} more"
+        send_and_track(msg.chat.id, f"👥 *Users (first 20)*\n\n{user_list}")
+    except Exception as e:
+        send_and_track(msg.chat.id, f"Error: {e}")
+
 # ================= HANDLERS =================
 @bot.message_handler(commands=["start","help"])
 def start(msg):
+    log_interaction(msg.from_user.id, msg.from_user.username, msg.from_user.first_name, "/start")
     send_and_track(msg.chat.id, "🤖 *Persona* — your crypto assistant\n\nChoose an option:", reply_markup=main_menu())
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -491,12 +579,16 @@ def handle_callback(call):
     global alert_id_counter, ws_restart_required
     cid = call.message.chat.id
     data = call.data
+    user_id = call.from_user.id
+    username = call.from_user.username
+    first_name = call.from_user.first_name
 
-    if not cooldown_ok(cid):
+    if not cooldown_ok(user_id):
         bot.answer_callback_query(call.id, "⏳ Slow down")
         return
 
     bot.answer_callback_query(call.id)
+    log_interaction(user_id, username, first_name, f"callback:{data[:50]}")
 
     try:
         if data == "back_main":
@@ -685,10 +777,15 @@ def handle_callback(call):
 def text_input(msg):
     global alert_id_counter, ws_restart_required
     cid = msg.chat.id
+    user_id = msg.from_user.id
+    username = msg.from_user.username
+    first_name = msg.from_user.first_name
     if cid not in waiting_for:
         return
     mode = waiting_for.pop(cid)
     text = msg.text.strip()
+    log_interaction(user_id, username, first_name, f"text:{mode}", text[:100])
+
     if not text:
         send_and_track(cid, "❌ Empty input. Please try again.", reply_markup=back_button())
         return
@@ -808,7 +905,8 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # ================= START BOT =================
-log("🚀 Persona — Production ready, CoinGecko info fixed")
+init_analytics()
+log("🚀 Persona — Production ready with user tracking")
 while not shutdown_flag:
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
