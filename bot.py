@@ -4,8 +4,8 @@ import threading
 import time
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-BOT_TOKEN = "8619003788:AAEszjzsxeKH8dSm8FPtqkPJxCG9Dw3Tne4"
-bot = telebot.TeleBot(BOT_TOKEN)
+import os
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8619003788:AAEszjzsxeKH8dSm8FPtqkPJxCG9Dw3Tne4")
 
 alerts = []
 alert_id_counter = [1]
