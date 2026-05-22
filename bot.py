@@ -24,7 +24,7 @@ CACHE_TTL = 10
 MAX_HISTORY = 3
 COOLDOWN_SECONDS = 2
 MAX_ALERTS_PER_USER = 20
-MAX_CA_LENGTH = 100  # contract address length limit
+MAX_CA_LENGTH = 100
 
 PRICE_CACHE = {}
 waiting_for = {}
@@ -34,6 +34,12 @@ ws_restart_required = False
 lock = threading.Lock()
 active_ws = None
 shutdown_flag = False
+
+# ================= SIMPLE MARKDOWN ESCAPE (safe, no telebot.util) =================
+def escape_md(text):
+    """Escape Telegram Markdown special characters."""
+    chars = r'_*[]()~`>#+-=|{}.!'
+    return ''.join('\\' + c if c in chars else c for c in text)
 
 # ================= ATOMIC SAVE & LOGGING =================
 def log(msg, level="INFO"):
@@ -68,7 +74,6 @@ def save_alerts():
         atomic_save(alerts, ALERTS_FILE)
 
 def cleanup_inactive_alerts():
-    """Remove inactive alerts older than 30 days to prevent file bloat."""
     now = time.time()
     cutoff = now - 30 * 86400
     global alerts
@@ -81,7 +86,7 @@ def cleanup_inactive_alerts():
 
 threading.Thread(target=cleanup_inactive_alerts, daemon=True).start()
 
-# ================= MESSAGE QUEUE WITH FALLBACK =================
+# ================= MESSAGE QUEUE =================
 def cleanup_old_messages(chat_id):
     if chat_id not in user_msg_queue:
         return
@@ -91,11 +96,11 @@ def cleanup_old_messages(chat_id):
         try:
             bot.delete_message(chat_id, old_id)
         except Exception as e:
-            # If deletion fails, just leave it; avoid infinite loop
             log(f"Failed to delete message {old_id}: {e}", "WARNING")
 
 def send_and_track(chat_id, text, reply_markup=None):
-    escaped_text = telebot.util.escape_markdown(text)
+    """Send a message, track its ID, and delete old ones."""
+    escaped_text = escape_md(text)   # safe escape
     sent = bot.send_message(chat_id, escaped_text, reply_markup=reply_markup)
     if chat_id not in user_msg_queue:
         user_msg_queue[chat_id] = []
@@ -173,7 +178,6 @@ def get_top_movers():
 
 @retry_with_backoff(max_retries=2)
 def get_coin_info(symbol):
-    # Cache search results for 1 hour
     if not hasattr(get_coin_info, "cache"):
         get_coin_info.cache = {}
     cache_key = symbol.lower()
@@ -185,7 +189,7 @@ def get_coin_info(symbol):
     try:
         r = session.get(f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}", timeout=10)
         if r.status_code == 429:
-            time.sleep(60)  # rate limit backoff
+            time.sleep(60)
             return None
         if r.status_code != 200:
             return None
@@ -231,7 +235,6 @@ def get_coin_info(symbol):
 
 @retry_with_backoff(max_retries=2)
 def get_multi_price(symbol):
-    # Similar caching could be added, but keep simple
     try:
         r = session.get(f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}", timeout=10)
         if r.status_code != 200:
@@ -256,7 +259,6 @@ def get_multi_price(symbol):
 def scan_ca(address):
     if len(address) > MAX_CA_LENGTH:
         return None
-    # Sanitize address
     address = re.sub(r'[^a-zA-Z0-9]', '', address)
     try:
         if address.startswith("0x") and len(address) == 42:
@@ -271,7 +273,6 @@ def scan_ca(address):
             if r.status_code == 200:
                 return r.json().get("result", {}).get(address.lower(), {})
         else:
-            # Solana
             url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={address}"
             r = session.get(url, timeout=10)
             if r.status_code == 200:
@@ -291,7 +292,7 @@ def format_price(price):
     else:
         return f"${price:.10f}"
 
-# ================= WEBSOCKET (daemon with heartbeat) =================
+# ================= WEBSOCKET =================
 def on_ws_message(ws, msg):
     try:
         data = json.loads(msg)
@@ -346,7 +347,7 @@ def websocket_loop():
 
 threading.Thread(target=websocket_loop, daemon=True).start()
 
-# ================= ALERT CHECKER WITH DEDUPLICATION =================
+# ================= ALERT CHECKER =================
 def check_alerts():
     last_triggered = {}
     while True:
@@ -367,7 +368,7 @@ def check_alerts():
                         price = cache["price"]
                     key = (a["chat_id"], a["id"])
                     if key in last_triggered and time.time() - last_triggered[key] < 300:
-                        continue  # prevent duplicate within 5 minutes
+                        continue
                     if (a["direction"] == ">" and price >= a["target"]) or (a["direction"] == "<" and price <= a["target"]):
                         a["active"] = False
                         triggered.append((a, price))
@@ -397,7 +398,6 @@ def memory_cleaner():
                 cooldowns.clear()
             if len(waiting_for) > 1000:
                 waiting_for.clear()
-            # Clean up message queues that are too long
             for cid in list(user_msg_queue.keys()):
                 if len(user_msg_queue[cid]) > MAX_HISTORY:
                     cleanup_old_messages(cid)
@@ -418,7 +418,6 @@ def main_menu():
 
 def price_menu():
     kb = InlineKeyboardMarkup()
-    # Reduced coin list for cleaner display
     coins = ["BTC","ETH","BNB","SOL","XRP","DOGE","ADA","AVAX","LINK","MATIC","UNI","ATOM","NEAR","APT","SUI","LTC","SHIB"]
     row = []
     for i, coin in enumerate(coins, 1):
@@ -479,7 +478,6 @@ def handle_callback(call):
         bot.answer_callback_query(call.id, "⏳ Slow down")
         return
 
-    # Always answer callback to prevent "loading" persistence
     bot.answer_callback_query(call.id)
 
     try:
@@ -558,7 +556,6 @@ def handle_callback(call):
                         save_alerts()
                         ws_restart_required = True
                         break
-            # Refresh list
             active = [a for a in alerts if a.get("chat_id") == cid and a.get("active", True)]
             if not active:
                 send_and_track(cid, "📋 No more active alerts.", reply_markup=back_button())
@@ -579,8 +576,7 @@ def handle_callback(call):
                 send_and_track(cid, f"❌ Could not fetch *{sym}*.", reply_markup=price_menu())
             else:
                 arrow = "🟢 ▲" if ch >= 0 else "🔴 ▼"
-                formatted_price = format_price(p)
-                send_and_track(cid, f"*{sym}*\n💵 {formatted_price}\n{arrow} {abs(ch):.2f}% (24h)", reply_markup=price_menu())
+                send_and_track(cid, f"*{sym}*\n💵 {format_price(p)}\n{arrow} {abs(ch):.2f}% (24h)", reply_markup=price_menu())
 
         elif data == "gainers":
             g, _ = get_top_movers()
@@ -686,8 +682,7 @@ def text_input(msg):
                 send_and_track(cid, f"❌ Could not fetch *{text.upper()}*.", reply_markup=price_menu())
             else:
                 arrow = "🟢 ▲" if ch >= 0 else "🔴 ▼"
-                formatted_price = format_price(p)
-                send_and_track(cid, f"*{text.upper()}*\n💵 {formatted_price}\n{arrow} {abs(ch):.2f}% (24h)", reply_markup=price_menu())
+                send_and_track(cid, f"*{text.upper()}*\n💵 {format_price(p)}\n{arrow} {abs(ch):.2f}% (24h)", reply_markup=price_menu())
 
         elif mode == "info":
             info = get_coin_info(text.upper())
