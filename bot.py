@@ -1,27 +1,24 @@
 import telebot
-import asyncio
+import requests
 import threading
 import time
 import os
-import requests
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from database import init_db, register_user, add_alert, get_alerts, deactivate_alert
-from websocket_engine import run_engines, prices
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8619003788:AAEszjzsxeKH8dSm8FPtqkPJxCG9Dw3Tne4")
 bot = telebot.TeleBot(BOT_TOKEN)
 
+alerts = []
+alert_id_counter = [1]
 waiting_for = {}
 main_msg = {}
 
-# ── Price ─────────────────────────────────────────────
+# ── API ───────────────────────────────────────────────
 def get_price(symbol):
-    price = prices.get(symbol.upper())
-    if price:
-        return price, 0
+    pair = symbol.upper() + "USDT"
     try:
         r = requests.get(
-            f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol.upper()}USDT",
+            f"https://api.binance.com/api/v3/ticker/24hr?symbol={pair}",
             timeout=10
         )
         data = r.json()
@@ -100,7 +97,11 @@ def get_multi_price(symbol):
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": coin_id, "vs_currencies": "usd,eur,gbp,jpy,cny,aed,try"},
+            params={
+                "ids": coin_id,
+                "vs_currencies": "usd,eur,gbp,jpy,cny,aed,try",
+                "include_24hr_change": "true"
+            },
             timeout=10
         )
         data = r.json()
@@ -294,14 +295,13 @@ def update_main(cid, text, markup):
 # ── /start ────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def start(msg):
-    asyncio.run(register_user(msg.chat.id, msg.from_user.username))
     waiting_for.pop(msg.chat.id, None)
     try:
         bot.delete_message(msg.chat.id, msg.message_id)
     except:
         pass
     update_main(msg.chat.id,
-        "🤖 *Persona V2* — your crypto assistant\n\nChoose an option:",
+        "🤖 *Persona* — your crypto assistant\n\nChoose an option:",
         main_menu()
     )
 
@@ -322,7 +322,7 @@ def handle_text(msg):
             symbol = text.upper()
             p, change = get_price(symbol)
             if p is None:
-                update_main(cid, f"❌ *{symbol}* not found.", price_menu())
+                update_main(cid, f"❌ *{symbol}* not found on Binance.", price_menu())
             else:
                 arrow = "🟢 ▲" if change >= 0 else "🔴 ▼"
                 update_main(cid,
@@ -352,15 +352,15 @@ def handle_text(msg):
 
         elif mode == "multi":
             symbol = text.upper()
-            prices_data = get_multi_price(symbol)
-            if not prices_data:
+            prices = get_multi_price(symbol)
+            if not prices:
                 update_main(cid, f"❌ *{symbol}* not found.", multi_coins_menu())
             else:
                 flags = {"usd": "🇺🇸", "eur": "🇪🇺", "gbp": "🇬🇧", "jpy": "🇯🇵", "cny": "🇨🇳", "aed": "🇦🇪", "try": "🇹🇷"}
                 symbols_map = {"usd": "$", "eur": "€", "gbp": "£", "jpy": "¥", "cny": "¥", "aed": "د.إ", "try": "₺"}
                 text_out = f"💱 *{symbol} Price*\n\n"
                 for cur, flag in flags.items():
-                    p = prices_data.get(cur)
+                    p = prices.get(cur)
                     if p:
                         text_out += f"{flag} {symbols_map[cur]}{p:,.4f}\n"
                 update_main(cid, text_out, multi_coins_menu())
@@ -368,23 +368,35 @@ def handle_text(msg):
         elif mode == "scan":
             result = scan_ca(text)
             if not result:
-                update_main(cid, "❌ Contract not found.\nSupports ETH, BSC, Solana.", back_button())
+                update_main(cid,
+                    "❌ Contract not found or unsupported chain.\nSupports ETH, BSC, Solana.",
+                    back_button()
+                )
             else:
                 name = result.get("token_name", "Unknown")
                 symbol = result.get("token_symbol", "?")
+                hp = result.get("is_honeypot", "?")
+                mint = result.get("is_mintable", "?")
+                proxy = result.get("is_proxy", "?")
+                buy_tax = result.get("buy_tax", "?")
+                sell_tax = result.get("sell_tax", "?")
+                open_source = result.get("is_open_source", "?")
+                holders = result.get("holder_count", "?")
+
                 def flag(v):
                     if v == "1": return "⚠️ Yes"
                     if v == "0": return "✅ No"
                     return "❓ Unknown"
+
                 update_main(cid,
                     f"🛡 *CA Scan: {name} ({symbol})*\n\n"
-                    f"🍯 Honeypot: {flag(result.get('is_honeypot','?'))}\n"
-                    f"🖨 Mintable: {flag(result.get('is_mintable','?'))}\n"
-                    f"🔁 Proxy: {flag(result.get('is_proxy','?'))}\n"
-                    f"📂 Open Source: {flag(result.get('is_open_source','?'))}\n"
-                    f"💸 Buy Tax: {result.get('buy_tax','?')}%\n"
-                    f"💸 Sell Tax: {result.get('sell_tax','?')}%\n"
-                    f"👥 Holders: {result.get('holder_count','?')}",
+                    f"🍯 Honeypot: {flag(hp)}\n"
+                    f"🖨 Mintable: {flag(mint)}\n"
+                    f"🔁 Proxy: {flag(proxy)}\n"
+                    f"📂 Open Source: {flag(open_source)}\n"
+                    f"💸 Buy Tax: {buy_tax}%\n"
+                    f"💸 Sell Tax: {sell_tax}%\n"
+                    f"👥 Holders: {holders}",
                     back_button()
                 )
 
@@ -397,7 +409,13 @@ def handle_text(msg):
                 direction = parts[1]
                 try:
                     target = float(parts[2])
-                    aid = asyncio.run(add_alert(cid, symbol, direction, target))
+                    aid = alert_id_counter[0]
+                    alert_id_counter[0] += 1
+                    alerts.append({
+                        "id": aid, "chat_id": cid,
+                        "coin": symbol, "target": target,
+                        "direction": direction, "active": True
+                    })
                     label = "rises above" if direction == ">" else "drops below"
                     update_main(cid,
                         f"🔔 Alert #{aid} set!\n*{symbol}* {label} *${target:,.2f}*",
@@ -407,7 +425,7 @@ def handle_text(msg):
                     update_main(cid, "❌ Invalid price value.", alerts_menu())
     else:
         update_main(cid,
-            "🤖 *Persona V2* — your crypto assistant\n\nChoose an option:",
+            "🤖 *Persona* — your crypto assistant\n\nChoose an option:",
             main_menu()
         )
 
@@ -422,7 +440,7 @@ def handle_callback(call):
     if data == "back_main":
         waiting_for.pop(cid, None)
         update_main(cid,
-            "🤖 *Persona V2* — your crypto assistant\n\nChoose an option:",
+            "🤖 *Persona* — your crypto assistant\n\nChoose an option:",
             main_menu()
         )
 
@@ -431,7 +449,10 @@ def handle_callback(call):
 
     elif data == "search_coin":
         waiting_for[cid] = "price"
-        update_main(cid, "🔍 *Type any coin symbol:*\nExample: `PEPE`, `WIF`, `SEI`", back_button())
+        update_main(cid,
+            "🔍 *Type any coin symbol:*\nExample: `PEPE`, `WIF`, `SEI`, `ORDI`",
+            back_button()
+        )
 
     elif data.startswith("price_"):
         symbol = data.split("_")[1]
@@ -454,14 +475,20 @@ def handle_callback(call):
         update_main(cid,
             "✏️ *Type your custom alert:*\n"
             "Format: `COIN > price` or `COIN < price`\n\n"
-            "Examples:\n`BTC > 95000`\n`PEPE < 0.00001`",
+            "Examples:\n`BTC > 95000`\n`PEPE < 0.00001`\n`WIF > 5`",
             back_button()
         )
 
     elif data.startswith("setalert_"):
         _, symbol, direction, target_str = data.split("_")
         target = float(target_str)
-        aid = asyncio.run(add_alert(cid, symbol, direction, target))
+        aid = alert_id_counter[0]
+        alert_id_counter[0] += 1
+        alerts.append({
+            "id": aid, "chat_id": cid,
+            "coin": symbol, "target": target,
+            "direction": direction, "active": True
+        })
         label = "rises above" if direction == ">" else "drops below"
         bot.answer_callback_query(call.id, "✅ Alert set!")
         update_main(cid,
@@ -470,7 +497,7 @@ def handle_callback(call):
         )
 
     elif data == "list_alerts":
-        user_alerts = asyncio.run(get_alerts(cid))
+        user_alerts = [a for a in alerts if a['chat_id'] == cid and a['active']]
         if not user_alerts:
             bot.answer_callback_query(call.id, "No active alerts.")
             update_main(cid, "📋 No active alerts.\n\nSet one below:", alerts_menu())
@@ -478,39 +505,40 @@ def handle_callback(call):
         text = "📋 *Active Alerts:*\n\n"
         kb = InlineKeyboardMarkup()
         for a in user_alerts:
-            aid, coin, direction, target = a
-            label = "▲" if direction == '>' else "▼"
-            text += f"#{aid} — {coin} {label} ${target:,.2f}\n"
+            label = "▲" if a['direction'] == '>' else "▼"
+            text += f"#{a['id']} — {a['coin']} {label} ${a['target']:,.2f}\n"
             kb.row(InlineKeyboardButton(
-                f"❌ Cancel #{aid} ({coin} {label} ${target:,.0f})",
-                callback_data=f"cancel_{aid}"
+                f"❌ Cancel #{a['id']} ({a['coin']} {label} ${a['target']:,.0f})",
+                callback_data=f"cancel_{a['id']}"
             ))
         kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
         update_main(cid, text, kb)
 
     elif data.startswith("cancel_"):
         aid = int(data.split("_")[1])
-        asyncio.run(deactivate_alert(aid))
-        bot.answer_callback_query(call.id, f"✅ Alert #{aid} cancelled.")
-        user_alerts = asyncio.run(get_alerts(cid))
+        for a in alerts:
+            if a['id'] == aid and a['chat_id'] == cid:
+                a['active'] = False
+                bot.answer_callback_query(call.id, f"✅ Alert #{aid} cancelled.")
+                break
+        user_alerts = [a for a in alerts if a['chat_id'] == cid and a['active']]
         if not user_alerts:
             update_main(cid, "📋 No more active alerts.", back_button())
         else:
             text = "📋 *Active Alerts:*\n\n"
             kb = InlineKeyboardMarkup()
             for a in user_alerts:
-                aid, coin, direction, target = a
-                label = "▲" if direction == '>' else "▼"
-                text += f"#{aid} — {coin} {label} ${target:,.2f}\n"
+                label = "▲" if a['direction'] == '>' else "▼"
+                text += f"#{a['id']} — {a['coin']} {label} ${a['target']:,.2f}\n"
                 kb.row(InlineKeyboardButton(
-                    f"❌ Cancel #{aid} ({coin} {label} ${target:,.0f})",
-                    callback_data=f"cancel_{aid}"
+                    f"❌ Cancel #{a['id']} ({a['coin']} {label} ${a['target']:,.0f})",
+                    callback_data=f"cancel_{a['id']}"
                 ))
             kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
             update_main(cid, text, kb)
 
     elif data == "gainers":
-        bot.answer_callback_query(call.id, "Fetching...")
+        bot.answer_callback_query(call.id, "Fetching top gainers...")
         g, _ = get_top_movers()
         if not g:
             update_main(cid, "❌ Failed to fetch.", back_button())
@@ -522,7 +550,7 @@ def handle_callback(call):
             update_main(cid, text, back_button())
 
     elif data == "losers":
-        bot.answer_callback_query(call.id, "Fetching...")
+        bot.answer_callback_query(call.id, "Fetching top losers...")
         _, l = get_top_movers()
         if not l:
             update_main(cid, "❌ Failed to fetch.", back_button())
@@ -538,14 +566,17 @@ def handle_callback(call):
 
     elif data == "search_info":
         waiting_for[cid] = "info"
-        update_main(cid, "🔍 *Type any coin symbol:*", back_button())
+        update_main(cid,
+            "🔍 *Type any coin symbol:*\nExample: `PEPE`, `WIF`, `INJ`, `TIA`",
+            back_button()
+        )
 
     elif data.startswith("info_"):
         symbol = data.split("_")[1]
         bot.answer_callback_query(call.id, f"Fetching {symbol} info...")
         info = get_coin_info(symbol)
         if not info:
-            update_main(cid, f"❌ Couldn't fetch *{symbol}*.", info_coins_menu())
+            update_main(cid, f"❌ Couldn't fetch info for *{symbol}*.", info_coins_menu())
         else:
             supply_str = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
             max_str = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
@@ -566,20 +597,23 @@ def handle_callback(call):
 
     elif data == "search_multi":
         waiting_for[cid] = "multi"
-        update_main(cid, "🔍 *Type any coin symbol:*", back_button())
+        update_main(cid,
+            "🔍 *Type any coin symbol:*\nExample: `BTC`, `ETH`, `SOL`",
+            back_button()
+        )
 
     elif data.startswith("multi_"):
         symbol = data.split("_")[1]
-        bot.answer_callback_query(call.id, f"Fetching {symbol}...")
-        prices_data = get_multi_price(symbol)
-        if not prices_data:
+        bot.answer_callback_query(call.id, f"Fetching {symbol} prices...")
+        prices = get_multi_price(symbol)
+        if not prices:
             update_main(cid, f"❌ Couldn't fetch *{symbol}*.", multi_coins_menu())
         else:
             flags = {"usd": "🇺🇸", "eur": "🇪🇺", "gbp": "🇬🇧", "jpy": "🇯🇵", "cny": "🇨🇳", "aed": "🇦🇪", "try": "🇹🇷"}
             symbols_map = {"usd": "$", "eur": "€", "gbp": "£", "jpy": "¥", "cny": "¥", "aed": "د.إ", "try": "₺"}
             text = f"💱 *{symbol} Price*\n\n"
             for cur, flag in flags.items():
-                p = prices_data.get(cur)
+                p = prices.get(cur)
                 if p:
                     text += f"{flag} {symbols_map[cur]}{p:,.4f}\n"
             update_main(cid, text, multi_coins_menu())
@@ -587,23 +621,40 @@ def handle_callback(call):
     elif data == "menu_scan":
         waiting_for[cid] = "scan"
         update_main(cid,
-            "🛡 *CA Scanner*\n\nPaste a contract address:\n✅ Supports ETH, BSC, Solana",
+            "🛡 *CA Scanner*\n\nPaste a contract address:\n"
+            "✅ Supports ETH, BSC, Solana\n\n"
+            "Example:\n`0x1234...abcd`",
             back_button()
         )
 
-# ── Launch ────────────────────────────────────────────
-def run_bot():
-    print("🤖 Bot polling...")
-    bot.infinity_polling()
+# ── Alert checker ─────────────────────────────────────
+def check_alerts():
+    while True:
+        active = [a for a in alerts if a['active']]
+        checked = {}
+        for a in active:
+            coin = a['coin']
+            if coin not in checked:
+                p, _ = get_price(coin)
+                checked[coin] = p
+            p = checked.get(coin)
+            if p is None:
+                continue
+            triggered = (a['direction'] == '>' and p >= a['target']) or \
+                        (a['direction'] == '<' and p <= a['target'])
+            if triggered:
+                a['active'] = False
+                label = "🚀 risen above" if a['direction'] == '>' else "📉 dropped below"
+                sent = bot.send_message(a['chat_id'],
+                    f"🔔 *Alert #{a['id']} triggered!*\n"
+                    f"*{coin}* has {label} *${a['target']:,.2f}*\n"
+                    f"Current price: *${p:,.4f}*",
+                    parse_mode="Markdown",
+                    reply_markup=main_menu()
+                )
+                main_msg[a['chat_id']] = sent.message_id
+        time.sleep(60)
 
-def run_async_engines():
-    asyncio.run(run_engines(bot))
-
-async def startup():
-    await init_db()
-    print("✅ Database ready")
-
-if __name__ == "__main__":
-    asyncio.run(startup())
-    threading.Thread(target=run_async_engines, daemon=True).start()
-    run_bot()
+threading.Thread(target=check_alerts, daemon=True).start()
+print("🚀 Persona running...")
+bot.infinity_polling()
