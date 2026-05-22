@@ -35,10 +35,10 @@ lock = threading.Lock()
 active_ws = None
 shutdown_flag = False
 
-# ================= SIMPLE MARKDOWN ESCAPE (safe, no telebot.util) =================
+# ================= ESCAPE MARKDOWN (parentheses allowed) =================
 def escape_md(text):
-    """Escape Telegram Markdown special characters."""
-    chars = r'_*[]()~`>#+-=|{}.!'
+    """Escape Telegram Markdown special characters, except parentheses."""
+    chars = r'_*[]~`>#+-=|{}.!'   # ( and ) are NOT escaped
     return ''.join('\\' + c if c in chars else c for c in text)
 
 # ================= ATOMIC SAVE & LOGGING =================
@@ -99,8 +99,7 @@ def cleanup_old_messages(chat_id):
             log(f"Failed to delete message {old_id}: {e}", "WARNING")
 
 def send_and_track(chat_id, text, reply_markup=None):
-    """Send a message, track its ID, and delete old ones."""
-    escaped_text = escape_md(text)   # safe escape
+    escaped_text = escape_md(text)
     sent = bot.send_message(chat_id, escaped_text, reply_markup=reply_markup)
     if chat_id not in user_msg_queue:
         user_msg_queue[chat_id] = []
