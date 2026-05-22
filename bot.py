@@ -907,6 +907,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 # ================= START BOT =================
 init_analytics()
 log("🚀 Persona — Production ready with user tracking")
+bot.delete_webhook()  # Clear any previous webhook/polling conflict
 while not shutdown_flag:
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
