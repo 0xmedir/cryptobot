@@ -5,7 +5,15 @@ import time
 import os
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8619003788:AAEszjzsxeKH8dSm8FPtqkPJxCG9Dw3Tne4")
+# ─────────────────────────────────────────────
+# TOKEN (IMPORTANT FIX: force safe fallback)
+# ─────────────────────────────────────────────
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN or BOT_TOKEN == "8619003788:AAEszjzsxeKH8dSm8FPtqkPJxCG9Dw3Tne4":
+    print("❌ BOT_TOKEN missing! Bot will not respond.")
+    exit()
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 alerts = []
@@ -13,48 +21,43 @@ alert_id_counter = [1]
 waiting_for = {}
 main_msg = {}
 
-# ─────────────────────────────────────────────
-# SAFE HELPERS
-# ─────────────────────────────────────────────
-def safe_delete(cid, mid):
-    try:
-        bot.delete_message(cid, mid)
-    except Exception as e:
-        print("Delete error:", e)
 
-
-def safe_request(url, **kwargs):
+# ─────────────────────────────────────────────
+# SAFE REQUEST (prevents silent crash)
+# ─────────────────────────────────────────────
+def safe_get(url, params=None):
     try:
-        r = requests.get(url, timeout=10, **kwargs)
+        r = requests.get(url, params=params, timeout=10)
         return r.json()
     except Exception as e:
-        print("Request error:", e)
+        print("API ERROR:", e)
         return None
 
 
 # ─────────────────────────────────────────────
-# API
+# PRICE
 # ─────────────────────────────────────────────
 def get_price(symbol):
     try:
-        pair = symbol.upper() + "USDT"
-
-        data = safe_request(
+        data = safe_get(
             "https://api.binance.com/api/v3/ticker/24hr",
-            params={"symbol": pair}
+            params={"symbol": symbol.upper() + "USDT"}
         )
 
         if data and "lastPrice" in data:
             return float(data["lastPrice"]), float(data["priceChangePercent"])
 
     except Exception as e:
-        print("get_price error:", e)
+        print("PRICE ERROR:", e)
 
     return None, None
 
 
+# ─────────────────────────────────────────────
+# TOP MOVERS
+# ─────────────────────────────────────────────
 def get_top_movers():
-    data = safe_request("https://api.binance.com/api/v3/ticker/24hr")
+    data = safe_get("https://api.binance.com/api/v3/ticker/24hr")
 
     if not data:
         return None, None
@@ -75,88 +78,8 @@ def get_top_movers():
         return sorted_data[:5], sorted_data[-5:][::-1]
 
     except Exception as e:
-        print("movers error:", e)
+        print("MOVERS ERROR:", e)
         return None, None
-
-
-def get_coin_info(symbol):
-    cg_map = {
-        "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
-        "SOL": "solana", "XRP": "ripple", "DOGE": "dogecoin",
-        "TON": "the-open-network", "AVAX": "avalanche-2", "ARB": "arbitrum",
-        "ADA": "cardano", "DOT": "polkadot", "LINK": "chainlink",
-        "MATIC": "matic-network", "UNI": "uniswap", "ATOM": "cosmos",
-        "NEAR": "near", "APT": "aptos", "SUI": "sui",
-        "TRX": "tron", "SHIB": "shiba-inu", "LTC": "litecoin",
-        "OP": "optimism", "INJ": "injective-protocol", "TIA": "celestia",
-    }
-
-    coin_id = cg_map.get(symbol.upper(), symbol.lower())
-
-    data = safe_request(
-        f"https://api.coingecko.com/api/v3/coins/{coin_id}",
-        params={
-            "localization": "false",
-            "tickers": "false",
-            "community_data": "false"
-        }
-    )
-
-    if not data or "market_data" not in data:
-        return None
-
-    md = data["market_data"]
-
-    return {
-        "name": data.get("name"),
-        "symbol": data.get("symbol", "").upper(),
-        "rank": data.get("market_cap_rank", "N/A"),
-        "price": md["current_price"].get("usd", 0),
-        "ath": md["ath"].get("usd", 0),
-        "ath_date": md["ath_date"].get("usd", "")[:10],
-        "ath_change": md["ath_change_percentage"].get("usd", 0),
-        "supply": md.get("circulating_supply", 0),
-        "max_supply": md.get("max_supply"),
-        "market_cap": md["market_cap"].get("usd", 0),
-        "volume": md["total_volume"].get("usd", 0),
-    }
-
-
-def scan_ca(address):
-    try:
-        if address.startswith("0x") and len(address) == 42:
-            r = requests.get(
-                f"https://api.gopluslabs.io/api/v1/token_security/1",
-                params={"contract_addresses": address},
-                timeout=10
-            )
-            data = r.json()
-            result = data.get("result", {}).get(address.lower(), {})
-
-            if not result:
-                r = requests.get(
-                    f"https://api.gopluslabs.io/api/v1/token_security/56",
-                    params={"contract_addresses": address},
-                    timeout=10
-                )
-                data = r.json()
-                result = data.get("result", {}).get(address.lower(), {})
-
-            return result
-
-        else:
-            r = requests.get(
-                f"https://api.gopluslabs.io/api/v1/solana/token_security",
-                params={"contract_addresses": address},
-                timeout=10
-            )
-            data = r.json()
-            return data.get("result", {}).get(address, {})
-
-    except Exception as e:
-        print("scan_ca error:", e)
-
-    return None
 
 
 # ─────────────────────────────────────────────
@@ -172,193 +95,202 @@ def main_menu():
         InlineKeyboardButton("🚀 Gainers", callback_data="gainers"),
         InlineKeyboardButton("📉 Losers", callback_data="losers")
     )
-    kb.row(
-        InlineKeyboardButton("🔎 Coin Info", callback_data="menu_info"),
-        InlineKeyboardButton("💱 Multi Price", callback_data="menu_multi")
-    )
-    kb.row(
-        InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"),
-        InlineKeyboardButton("📋 My Alerts", callback_data="list_alerts")
-    )
     return kb
 
 
-def price_menu():
+def back_button():
     kb = InlineKeyboardMarkup()
-    kb.row(
-        InlineKeyboardButton("BTC", callback_data="price_BTC"),
-        InlineKeyboardButton("ETH", callback_data="price_ETH"),
-        InlineKeyboardButton("BNB", callback_data="price_BNB")
-    )
-    kb.row(
-        InlineKeyboardButton("SOL", callback_data="price_SOL"),
-        InlineKeyboardButton("XRP", callback_data="price_XRP"),
-        InlineKeyboardButton("DOGE", callback_data="price_DOGE")
-    )
-    kb.row(
-        InlineKeyboardButton("TON", callback_data="price_TON"),
-        InlineKeyboardButton("AVAX", callback_data="price_AVAX"),
-        InlineKeyboardButton("ARB", callback_data="price_ARB")
-    )
-    kb.row(
-        InlineKeyboardButton("ADA", callback_data="price_ADA"),
-        InlineKeyboardButton("DOT", callback_data="price_DOT"),
-        InlineKeyboardButton("LINK", callback_data="price_LINK")
-    )
-    kb.row(
-        InlineKeyboardButton("MATIC", callback_data="price_MATIC"),
-        InlineKeyboardButton("UNI", callback_data="price_UNI"),
-        InlineKeyboardButton("ATOM", callback_data="price_ATOM")
-    )
-    kb.row(
-        InlineKeyboardButton("NEAR", callback_data="price_NEAR"),
-        InlineKeyboardButton("APT", callback_data="price_APT"),
-        InlineKeyboardButton("SUI", callback_data="price_SUI")
-    )
-    kb.row(
-        InlineKeyboardButton("TRX", callback_data="price_TRX"),
-        InlineKeyboardButton("SHIB", callback_data="price_SHIB"),
-        InlineKeyboardButton("LTC", callback_data="price_LTC")
-    )
-    kb.row(
-        InlineKeyboardButton("OP", callback_data="price_OP"),
-        InlineKeyboardButton("INJ", callback_data="price_INJ"),
-        InlineKeyboardButton("TIA", callback_data="price_TIA")
-    )
-    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_coin"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
 
-# (other keyboards unchanged — keep yours as-is)
-# alerts_menu(), info_coins_menu(), multi_coins_menu(), etc.
+# ─────────────────────────────────────────────
+# SAFE DELETE (prevents silent crash)
+# ─────────────────────────────────────────────
+def safe_delete(cid, mid):
+    try:
+        bot.delete_message(cid, mid)
+    except Exception as e:
+        print("DELETE ERROR:", e)
 
 
 # ─────────────────────────────────────────────
-# MAIN UPDATE
+# UPDATE MESSAGE
 # ─────────────────────────────────────────────
 def update_main(cid, text, markup):
-    old_mid = main_msg.get(cid)
+    try:
+        old = main_msg.get(cid)
 
-    sent = bot.send_message(
-        cid,
-        text,
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
+        sent = bot.send_message(
+            cid,
+            text,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
 
-    main_msg[cid] = sent.message_id
+        main_msg[cid] = sent.message_id
 
-    if old_mid:
-        threading.Thread(
-            target=lambda: (time.sleep(5), safe_delete(cid, old_mid)),
-            daemon=True
-        ).start()
+        if old:
+            threading.Thread(
+                target=lambda: (time.sleep(5), safe_delete(cid, old)),
+                daemon=True
+            ).start()
+
+    except Exception as e:
+        print("UPDATE ERROR:", e)
 
 
 # ─────────────────────────────────────────────
-# START
+# START (CRITICAL FIX: make sure it always responds)
 # ─────────────────────────────────────────────
 @bot.message_handler(commands=["start", "help"])
 def start(msg):
-    waiting_for.pop(msg.chat.id, None)
-    update_main(
-        msg.chat.id,
-        "🤖 *Persona* — your crypto assistant",
-        main_menu()
-    )
+    try:
+        waiting_for.pop(msg.chat.id, None)
+
+        update_main(
+            msg.chat.id,
+            "🤖 *Persona* — your crypto assistant\n\nChoose an option:",
+            main_menu()
+        )
+
+    except Exception as e:
+        print("START ERROR:", e)
 
 
 # ─────────────────────────────────────────────
-# TEXT HANDLER (UNCHANGED LOGIC)
+# TEXT HANDLER (SAFE)
 # ─────────────────────────────────────────────
 @bot.message_handler(func=lambda msg: True)
 def handle_text(msg):
-    cid = msg.chat.id
-    text = msg.text.strip()
+    try:
+        cid = msg.chat.id
+        text = msg.text.strip()
 
-    safe_delete(cid, msg.message_id)
+        safe_delete(cid, msg.message_id)
 
-    if cid not in waiting_for:
-        update_main(cid, "Menu:", main_menu())
-        return
+        if cid not in waiting_for:
+            update_main(cid, "🤖 Menu:", main_menu())
+            return
 
-    mode = waiting_for.pop(cid)
+        mode = waiting_for.pop(cid)
 
-    if mode == "price":
-        p, change = get_price(text)
+        if mode == "price":
+            p, ch = get_price(text)
 
-        if p is None:
-            update_main(cid, f"❌ {text} not found", main_menu())
-        else:
-            arrow = "🟢 ▲" if change >= 0 else "🔴 ▼"
-            update_main(
-                cid,
-                f"*{text.upper()}*\n💵 ${p:,.4f}\n{arrow} {abs(change):.2f}%",
-                main_menu()
-            )
+            if p is None:
+                update_main(cid, f"❌ {text} not found", main_menu())
+            else:
+                arrow = "🟢 ▲" if ch >= 0 else "🔴 ▼"
+                update_main(
+                    cid,
+                    f"*{text.upper()}*\n💵 ${p:,.4f}\n{arrow} {abs(ch):.2f}%",
+                    main_menu()
+                )
 
-    elif mode == "alert":
-        try:
-            coin, direction, target = text.split()
-            target = float(target)
+        elif mode == "alert":
+            try:
+                coin, direction, target = text.split()
+                target = float(target)
 
-            aid = alert_id_counter[0]
-            alert_id_counter[0] += 1
+                aid = alert_id_counter[0]
+                alert_id_counter[0] += 1
 
-            alerts.append({
-                "id": aid,
-                "chat_id": cid,
-                "coin": coin.upper(),
-                "direction": direction,
-                "target": target,
-                "active": True
-            })
+                alerts.append({
+                    "id": aid,
+                    "chat_id": cid,
+                    "coin": coin.upper(),
+                    "direction": direction,
+                    "target": target,
+                    "active": True
+                })
 
-            update_main(cid, f"🔔 Alert #{aid} set!", main_menu())
+                update_main(cid, f"🔔 Alert #{aid} set!", main_menu())
 
-        except Exception as e:
-            print("alert error:", e)
-            update_main(cid, "❌ Format: BTC > 70000", main_menu())
+            except:
+                update_main(cid, "❌ Format: BTC > 70000", main_menu())
+
+    except Exception as e:
+        print("TEXT ERROR:", e)
 
 
 # ─────────────────────────────────────────────
-# ALERT LOOP (FIXED ONLY)
+# CALLBACKS (SAFE WRAPPER)
+# ─────────────────────────────────────────────
+@bot.callback_query_handler(func=lambda call: True)
+def callback(call):
+    try:
+        cid = call.message.chat.id
+        data = call.data
+
+        if data == "back_main":
+            update_main(cid, "🤖 Menu:", main_menu())
+
+        elif data == "menu_price":
+            waiting_for[cid] = "price"
+            update_main(cid, "Send coin symbol", back_button())
+
+        elif data == "menu_alerts":
+            waiting_for[cid] = "alert"
+            update_main(cid, "Format: BTC > 70000", back_button())
+
+        elif data == "gainers":
+            g, _ = get_top_movers()
+            if not g:
+                return
+
+            text = "🚀 Gainers:\n\n"
+            for d in g:
+                text += f"{d['symbol']} ▲ {d['priceChangePercent']}%\n"
+
+            update_main(cid, text, back_button())
+
+        elif data == "losers":
+            _, l = get_top_movers()
+            if not l:
+                return
+
+            text = "📉 Losers:\n\n"
+            for d in l:
+                text += f"{d['symbol']} ▼ {d['priceChangePercent']}%\n"
+
+            update_main(cid, text, back_button())
+
+    except Exception as e:
+        print("CALLBACK ERROR:", e)
+
+
+# ─────────────────────────────────────────────
+# ALERT ENGINE (SAFE)
 # ─────────────────────────────────────────────
 def check_alerts():
     while True:
         try:
-            active = [a for a in alerts if a["active"]]
-            checked = {}
+            for a in alerts:
+                if not a["active"]:
+                    continue
 
-            for a in active:
-                coin = a["coin"]
-
-                if coin not in checked:
-                    p, _ = get_price(coin)
-                    checked[coin] = p
-
-                p = checked.get(coin)
-
+                p, _ = get_price(a["coin"])
                 if p is None:
                     continue
 
-                if (
+                triggered = (
                     (a["direction"] == ">" and p >= a["target"]) or
                     (a["direction"] == "<" and p <= a["target"])
-                ):
+                )
+
+                if triggered:
                     a["active"] = False
 
                     bot.send_message(
                         a["chat_id"],
-                        f"🔔 Alert #{a['id']} triggered!\n"
-                        f"{coin} → {p}"
+                        f"🔔 ALERT #{a['id']}\n{a['coin']} → {p}"
                     )
 
             time.sleep(60)
 
         except Exception as e:
-            print("alert loop error:", e)
+            print("ALERT ERROR:", e)
             time.sleep(5)
 
 
@@ -367,4 +299,4 @@ threading.Thread(target=check_alerts, daemon=True).start()
 
 # ─────────────────────────────────────────────
 print("🚀 Persona running...")
-bot.infinity_polling()
+bot.infinity_polling(skip_pending=True)
