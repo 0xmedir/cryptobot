@@ -1,5 +1,4 @@
 pyTelegramBotAPI
 requests
-aiohttp
-websockets
-aiosqlite
+websocket-client
+python-dotenv
