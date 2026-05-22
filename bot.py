@@ -93,7 +93,6 @@ def cleanup_old_messages(chat_id):
             log(f"Failed to delete message {old_id}: {e}", "WARNING")
 
 def send_and_track(chat_id, text, reply_markup=None):
-    """Send a message without escaping (markdown will work)."""
     sent = bot.send_message(chat_id, text, reply_markup=reply_markup)
     if chat_id not in user_msg_queue:
         user_msg_queue[chat_id] = []
@@ -128,7 +127,7 @@ def retry_with_backoff(max_retries=3, base_delay=1):
 
 # ================= GLOBAL REQUESTS SESSION =================
 session = requests.Session()
-session.headers.update({"User-Agent": "PersonaBot/1.0 (crypto assistant)"})
+session.headers.update({"User-Agent": "PersonaBot/2.0 (crypto assistant)"})
 
 # ================= API =================
 @retry_with_backoff(max_retries=2)
@@ -169,39 +168,65 @@ def get_top_movers():
         log(f"get_top_movers error: {e}", "ERROR")
         return None, None
 
-@retry_with_backoff(max_retries=2)
+# Improved get_coin_info with direct ID mapping and better caching
+@retry_with_backoff(max_retries=3, base_delay=2)
 def get_coin_info(symbol):
+    symbol_up = symbol.upper()
+    # Cache for 1 hour
     if not hasattr(get_coin_info, "cache"):
         get_coin_info.cache = {}
-    cache_key = symbol.lower()
     now = time.time()
-    if cache_key in get_coin_info.cache:
-        cached = get_coin_info.cache[cache_key]
+    if symbol_up in get_coin_info.cache:
+        cached = get_coin_info.cache[symbol_up]
         if now - cached["timestamp"] < 3600:
             return cached["data"]
-    try:
-        r = session.get(f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}", timeout=10)
-        if r.status_code == 429:
-            time.sleep(60)
+
+    # Direct mapping for most popular coins (faster, avoids search)
+    cg_id_map = {
+        "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
+        "SOL": "solana", "XRP": "ripple", "DOGE": "dogecoin",
+        "ADA": "cardano", "AVAX": "avalanche-2", "LINK": "chainlink",
+        "MATIC": "matic-network", "UNI": "uniswap", "ATOM": "cosmos",
+        "NEAR": "near", "APT": "aptos", "SUI": "sui", "LTC": "litecoin",
+        "SHIB": "shiba-inu", "TON": "the-open-network", "ARB": "arbitrum",
+        "OP": "optimism", "INJ": "injective-protocol", "TIA": "celestia",
+        "PEPE": "pepe", "WIF": "dogwifcoin", "SEI": "sei-network"
+    }
+    coin_id = cg_id_map.get(symbol_up)
+    if not coin_id:
+        # Fallback to search
+        try:
+            r = session.get(f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}", timeout=10)
+            if r.status_code == 200:
+                coins = r.json().get("coins", [])
+                if coins:
+                    coin_id = coins[0]["id"]
+                else:
+                    return None
+            else:
+                return None
+        except Exception as e:
+            log(f"Coin search error: {e}", "ERROR")
             return None
-        if r.status_code != 200:
-            return None
-        coins = r.json().get("coins", [])
-        if not coins:
-            return None
-        coin_id = coins[0]["id"]
-    except Exception as e:
-        log(f"Coin search error: {e}", "ERROR")
-        return None
+
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-        params = {"localization":"false","tickers":"false","community_data":"false"}
-        r = session.get(url, params=params, timeout=10)
+        params = {
+            "localization": "false",
+            "tickers": "false",
+            "community_data": "false",
+            "developer_data": "false",
+            "sparkline": "false"
+        }
+        r = session.get(url, params=params, timeout=15)
         if r.status_code == 429:
+            log("CoinGecko rate limit, waiting 60s", "WARNING")
             time.sleep(60)
             return None
         if r.status_code != 200:
+            log(f"CoinGecko returned {r.status_code} for {symbol_up}", "WARNING")
             return None
+
         data = r.json()
         md = data["market_data"]
         result = {
@@ -220,10 +245,10 @@ def get_coin_info(symbol):
             "market_cap": md.get("market_cap", {}).get("usd", 0),
             "volume": md.get("total_volume", {}).get("usd", 0),
         }
-        get_coin_info.cache[cache_key] = {"data": result, "timestamp": now}
+        get_coin_info.cache[symbol_up] = {"data": result, "timestamp": now}
         return result
     except Exception as e:
-        log(f"Coin detail error: {e}", "ERROR")
+        log(f"Coin info error for {symbol_up}: {e}", "ERROR")
         return None
 
 @retry_with_backoff(max_retries=2)
@@ -783,7 +808,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # ================= START BOT =================
-log("🚀 Persona — Production ready, markdown works correctly")
+log("🚀 Persona — Production ready, CoinGecko info fixed")
 while not shutdown_flag:
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
