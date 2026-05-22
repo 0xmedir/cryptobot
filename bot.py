@@ -13,11 +13,9 @@ from telebot.formatting import escape_markdown
 # ================= CONFIG =================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8619003788:AAEszjzsxeKH8dSm8FPtqkPJxCG9Dw3Tne4")
-
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 ALERTS_FILE = "alerts.json"
-
 CACHE_TTL = 10
 MAX_HISTORY = 3
 COOLDOWN_SECONDS = 2
@@ -26,9 +24,7 @@ PRICE_CACHE = {}
 waiting_for = {}
 user_msg_history = {}
 cooldowns = {}
-
 ws_restart_required = False
-
 lock = threading.Lock()
 
 # ================= ALERT STORAGE =================
@@ -109,7 +105,7 @@ def retry(max_retries=3, delay=1):
         return wrapper
     return decorator
 
-# ================= API =================
+# ================= API (Full) =================
 
 @retry()
 def get_price(symbol):
@@ -137,6 +133,94 @@ def get_top_movers():
     ]
     sorted_data = sorted(filtered, key=lambda x: float(x["priceChangePercent"]), reverse=True)
     return sorted_data[:5], sorted_data[-5:][::-1]
+
+@retry()
+def get_coin_info(symbol):
+    try:
+        search_url = f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}"
+        r = requests.get(search_url, timeout=10)
+        if r.status_code != 200:
+            return None
+        coins = r.json().get("coins", [])
+        if not coins:
+            return None
+        coin_id = coins[0]["id"]
+    except:
+        return None
+
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+        params = {"localization": "false", "tickers": "false", "community_data": "false"}
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        md = data["market_data"]
+        return {
+            "name": data["name"],
+            "symbol": data["symbol"].upper(),
+            "rank": data.get("market_cap_rank", "N/A"),
+            "price": md["current_price"].get("usd", 0),
+            "ath": md["ath"].get("usd", 0),
+            "ath_date": md["ath_date"].get("usd", "")[:10],
+            "ath_change": md["ath_change_percentage"].get("usd", 0),
+            "supply": md.get("circulating_supply", 0),
+            "max_supply": md.get("max_supply"),
+            "market_cap": md["market_cap"].get("usd", 0),
+            "volume": md["total_volume"].get("usd", 0),
+        }
+    except:
+        return None
+
+@retry()
+def get_multi_price(symbol):
+    try:
+        search_url = f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}"
+        r = requests.get(search_url, timeout=10)
+        if r.status_code != 200:
+            return None
+        coins = r.json().get("coins", [])
+        if not coins:
+            return None
+        coin_id = coins[0]["id"]
+    except:
+        return None
+
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {
+            "ids": coin_id,
+            "vs_currencies": "usd,eur,gbp,jpy,cny,aed,try",
+            "include_24hr_change": "true"
+        }
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            return r.json().get(coin_id)
+    except:
+        return None
+
+@retry()
+def scan_ca(address):
+    try:
+        if address.startswith("0x") and len(address) == 42:
+            url = f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={address}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                result = r.json().get("result", {}).get(address.lower(), {})
+                if result:
+                    return result
+            url = f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={address}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.json().get("result", {}).get(address.lower(), {})
+        else:
+            url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={address}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.json().get("result", {}).get(address, {})
+    except:
+        pass
+    return None
 
 # ================= WEBSOCKET =================
 
@@ -255,7 +339,7 @@ def memory_cleaner():
 
 threading.Thread(target=memory_cleaner, daemon=True).start()
 
-# ================= MENUS =================
+# ================= KEYBOARDS (Full) =================
 
 def main_menu():
     kb = InlineKeyboardMarkup()
@@ -268,20 +352,27 @@ def main_menu():
         InlineKeyboardButton("📉 Losers", callback_data="losers")
     )
     kb.row(
+        InlineKeyboardButton("🔎 Coin Info", callback_data="menu_info"),
+        InlineKeyboardButton("💱 Multi Price", callback_data="menu_multi")
+    )
+    kb.row(
+        InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"),
         InlineKeyboardButton("📋 My Alerts", callback_data="list_alerts")
     )
     return kb
 
 def price_menu():
     kb = InlineKeyboardMarkup()
-    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
+    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "TON", "AVAX", "ARB", "ADA", "DOT", "LINK", "MATIC", "UNI", "ATOM", "NEAR", "APT", "SUI", "TRX", "SHIB", "LTC", "OP", "INJ", "TIA"]
     row = []
     for i, coin in enumerate(coins, 1):
         row.append(InlineKeyboardButton(coin, callback_data=f"price_{coin}"))
         if i % 3 == 0:
             kb.row(*row)
             row = []
-    kb.row(InlineKeyboardButton("🔍 Search", callback_data="search_coin"))
+    if row:
+        kb.row(*row)
+    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_coin"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
@@ -291,39 +382,86 @@ def alerts_menu():
         InlineKeyboardButton("BTC > 100k", callback_data="setalert_BTC_>_100000"),
         InlineKeyboardButton("BTC < 80k", callback_data="setalert_BTC_<_80000")
     )
-    kb.row(InlineKeyboardButton("✏️ Custom Alert", callback_data="custom_alert"))
+    kb.row(
+        InlineKeyboardButton("ETH > 4k", callback_data="setalert_ETH_>_4000"),
+        InlineKeyboardButton("ETH < 2k", callback_data="setalert_ETH_<_2000")
+    )
+    kb.row(
+        InlineKeyboardButton("SOL > 200", callback_data="setalert_SOL_>_200"),
+        InlineKeyboardButton("SOL < 100", callback_data="setalert_SOL_<_100")
+    )
+    kb.row(InlineKeyboardButton("✏️ Custom alert", callback_data="custom_alert"))
+    kb.row(InlineKeyboardButton("📋 My Alerts", callback_data="list_alerts"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
-# ================= PRICE DISPLAY =================
+def back_button():
+    kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main"))
+    return kb
 
-def show_price(chat_id, symbol):
-    bot.send_chat_action(chat_id, "typing")
-    clean_symbol = symbol.upper()
-    price, change = get_price(clean_symbol)
-    if price is None:
-        safe_send(chat_id, f"❌ Could not fetch *{escape_markdown(clean_symbol)}*")
-        return
-    arrow = "🟢 ▲" if change >= 0 else "🔴 ▼"
-    safe_send(
-        chat_id,
-        f"*{escape_markdown(clean_symbol)}*\n"
-        f"💵 ${price:,.4f}\n"
-        f"{arrow} {abs(change):.2f}% (24h)",
-        reply_markup=price_menu()
+def info_coins_menu():
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("BTC", callback_data="info_BTC"),
+        InlineKeyboardButton("ETH", callback_data="info_ETH"),
+        InlineKeyboardButton("BNB", callback_data="info_BNB")
     )
+    kb.row(
+        InlineKeyboardButton("SOL", callback_data="info_SOL"),
+        InlineKeyboardButton("XRP", callback_data="info_XRP"),
+        InlineKeyboardButton("ADA", callback_data="info_ADA")
+    )
+    kb.row(
+        InlineKeyboardButton("DOGE", callback_data="info_DOGE"),
+        InlineKeyboardButton("AVAX", callback_data="info_AVAX"),
+        InlineKeyboardButton("LINK", callback_data="info_LINK")
+    )
+    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_info"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return kb
+
+def multi_coins_menu():
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("BTC", callback_data="multi_BTC"),
+        InlineKeyboardButton("ETH", callback_data="multi_ETH"),
+        InlineKeyboardButton("BNB", callback_data="multi_BNB")
+    )
+    kb.row(
+        InlineKeyboardButton("SOL", callback_data="multi_SOL"),
+        InlineKeyboardButton("XRP", callback_data="multi_XRP"),
+        InlineKeyboardButton("ADA", callback_data="multi_ADA")
+    )
+    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return kb
+
+# ================= STREAMING PRICE =================
+
+def stream_price_update(chat_id, symbol):
+    sent = bot.send_message(chat_id, f"⏳ Fetching {symbol} price...", parse_mode="Markdown")
+    if chat_id not in user_msg_history:
+        user_msg_history[chat_id] = []
+    user_msg_history[chat_id].append(sent.message_id)
+    cleanup_old_messages(chat_id)
+
+    price, change = get_price(symbol)
+    if price is None:
+        safe_edit(chat_id, sent.message_id, f"❌ Could not fetch {symbol}. Please try again.")
+    else:
+        arrow = "🟢 ▲" if change >= 0 else "🔴 ▼"
+        safe_edit(chat_id, sent.message_id,
+                  f"*{symbol}*\n💵 ${price:,.4f}\n{arrow} {abs(change):.2f}% (24h)",
+                  reply_markup=price_menu())
 
 # ================= START =================
 
 @bot.message_handler(commands=["start", "help"])
 def start(msg):
-    safe_send(
-        msg.chat.id,
-        "🤖 *Persona* — crypto assistant\n\nChoose an option:",
-        reply_markup=main_menu()
-    )
+    safe_send(msg.chat.id, "🤖 *Persona* — your crypto assistant\n\nChoose an option:", reply_markup=main_menu())
 
-# ================= CALLBACKS =================
+# ================= CALLBACKS (Full) =================
 
 @bot.callback_query_handler(func=lambda call: True)
 def callbacks(call):
@@ -337,32 +475,41 @@ def callbacks(call):
         return
 
     try:
+        # ----- Navigation -----
         if data == "back_main":
             waiting_for.pop(cid, None)
-            safe_edit(cid, mid, "🤖 *Persona* — crypto assistant", reply_markup=main_menu())
+            safe_edit(cid, mid, "🤖 *Persona* — your crypto assistant\n\nChoose an option:", reply_markup=main_menu())
+            bot.answer_callback_query(call.id)
 
         elif data == "menu_price":
-            safe_edit(cid, mid, "💰 *Select a coin:*", reply_markup=price_menu())
+            safe_edit(cid, mid, "💰 *Select a coin or search:*", reply_markup=price_menu())
+            bot.answer_callback_query(call.id)
+
+        elif data == "search_coin":
+            waiting_for[cid] = "price"
+            safe_edit(cid, mid, "🔍 *Type any coin symbol:*\nExample: `PEPE`, `WIF`, `SEI`", reply_markup=back_button())
+            bot.answer_callback_query(call.id)
 
         elif data.startswith("price_"):
             symbol = data.split("_")[1]
             bot.answer_callback_query(call.id, f"Fetching {symbol}...")
-            show_price(cid, symbol)
+            stream_price_update(cid, symbol)
 
-        elif data == "search_coin":
-            waiting_for[cid] = "price"
-            safe_edit(cid, mid, "🔍 *Type any coin symbol*\n\nExample: `PEPE`", reply_markup=price_menu())
-
+        # ----- Alerts Menu -----
         elif data == "menu_alerts":
-            safe_edit(cid, mid, "🔔 *Alerts Menu*", reply_markup=alerts_menu())
+            safe_edit(cid, mid, "🔔 *Quick Alerts* — tap to set or create custom:", reply_markup=alerts_menu())
+            bot.answer_callback_query(call.id)
 
         elif data == "custom_alert":
             waiting_for[cid] = "alert"
-            safe_edit(cid, mid, "✏️ *Format:*\n`BTC > 100000`", reply_markup=alerts_menu())
+            safe_edit(cid, mid, "✏️ *Type your custom alert:*\nFormat: `COIN > price` or `COIN < price`\n\nExamples:\n`BTC > 95000`\n`PEPE < 0.00001`", reply_markup=back_button())
+            bot.answer_callback_query(call.id)
 
         elif data.startswith("setalert_"):
-            _, symbol, direction, target_str = data.split("_")
-            target = float(target_str)
+            parts = data.split("_")
+            symbol = parts[1]
+            direction = parts[2]
+            target = float(parts[3])
             with lock:
                 alerts.append({
                     "id": alert_id_counter,
@@ -376,67 +523,137 @@ def callbacks(call):
                 alert_id_counter += 1
             save_alerts()
             ws_restart_required = True
-            safe_edit(cid, mid, f"✅ Alert #{current_id} set\n*{symbol}* {direction} *${target:,.2f}*", reply_markup=alerts_menu())
+            bot.answer_callback_query(call.id, "✅ Alert set!")
+            safe_edit(cid, mid, f"🔔 Alert #{current_id} set!\n*{symbol}* {direction} *${target:,.2f}*", reply_markup=alerts_menu())
 
-        elif data == "gainers":
-            g, _ = get_top_movers()
-            if not g:
-                safe_send(cid, "❌ Failed to fetch")
-                return
-            text = "🚀 *Top Gainers*\n\n"
-            for d in g:
-                coin = d["symbol"].replace("USDT", "")
-                text += f"🟢 *{coin}* {float(d['priceChangePercent']):.2f}%\n"
-            safe_send(cid, text)
-
-        elif data == "losers":
-            _, l = get_top_movers()
-            if not l:
-                safe_send(cid, "❌ Failed to fetch")
-                return
-            text = "📉 *Top Losers*\n\n"
-            for d in l:
-                coin = d["symbol"].replace("USDT", "")
-                text += f"🔴 *{coin}* {float(d['priceChangePercent']):.2f}%\n"
-            safe_send(cid, text)
-
+        # ----- List & Cancel Alerts -----
         elif data == "list_alerts":
             active = [a for a in alerts if a["chat_id"] == cid and a["active"]]
             if not active:
-                safe_send(cid, "📋 No active alerts")
+                bot.answer_callback_query(call.id, "No active alerts.")
+                safe_edit(cid, mid, "📋 No active alerts.\n\nSet one below:", reply_markup=alerts_menu())
                 return
-            text = "📋 *Your Alerts*\n\n"
-            for a in active:
-                text += f"#{a['id']} {a['coin']} {a['direction']} ${a['target']:,.2f}\n"
-            # Add cancel buttons for each alert
+            text = "📋 *Active Alerts:*\n\n"
             kb = InlineKeyboardMarkup()
             for a in active:
+                label = "▲" if a['direction'] == '>' else "▼"
+                text += f"#{a['id']} — {a['coin']} {label} ${a['target']:,.2f}\n"
                 kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
             kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-            safe_send(cid, text, reply_markup=kb)
+            safe_edit(cid, mid, text, reply_markup=kb)
+            bot.answer_callback_query(call.id)
 
         elif data.startswith("cancel_"):
-            alert_id = int(data.split("_")[1])
+            aid = int(data.split("_")[1])
             with lock:
                 for a in alerts:
-                    if a["id"] == alert_id and a["chat_id"] == cid:
-                        a["active"] = False
+                    if a['id'] == aid and a['chat_id'] == cid:
+                        a['active'] = False
                         save_alerts()
                         ws_restart_required = True
-                        bot.answer_callback_query(call.id, f"✅ Alert #{alert_id} cancelled")
+                        bot.answer_callback_query(call.id, f"✅ Alert #{aid} cancelled.")
                         break
             # Refresh list
-            active = [a for a in alerts if a["chat_id"] == cid and a["active"]]
+            active = [a for a in alerts if a['chat_id'] == cid and a['active']]
             if not active:
-                safe_edit(cid, mid, "📋 No active alerts", reply_markup=main_menu())
+                safe_edit(cid, mid, "📋 No more active alerts.", reply_markup=back_button())
             else:
-                text = "📋 *Your Alerts*\n\n"
+                text = "📋 *Active Alerts:*\n\n"
                 kb = InlineKeyboardMarkup()
                 for a in active:
-                    text += f"#{a['id']} {a['coin']} {a['direction']} ${a['target']:,.2f}\n"
+                    label = "▲" if a['direction'] == '>' else "▼"
+                    text += f"#{a['id']} — {a['coin']} {label} ${a['target']:,.2f}\n"
                     kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
                 kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
                 safe_edit(cid, mid, text, reply_markup=kb)
+
+        # ----- Gainers / Losers -----
+        elif data == "gainers":
+            bot.answer_callback_query(call.id, "Fetching top gainers...")
+            g, _ = get_top_movers()
+            if not g:
+                safe_edit(cid, mid, "❌ Failed to fetch.", reply_markup=back_button())
+            else:
+                text = "🚀 *Top 5 Gainers (24h)*\n\n"
+                for d in g:
+                    coin = d["symbol"].replace("USDT", "")
+                    text += f"🟢 *{coin}* — ${float(d['lastPrice']):,.4f} ▲ {float(d['priceChangePercent']):.2f}%\n"
+                safe_edit(cid, mid, text, reply_markup=back_button())
+
+        elif data == "losers":
+            bot.answer_callback_query(call.id, "Fetching top losers...")
+            _, l = get_top_movers()
+            if not l:
+                safe_edit(cid, mid, "❌ Failed to fetch.", reply_markup=back_button())
+            else:
+                text = "📉 *Top 5 Losers (24h)*\n\n"
+                for d in l:
+                    coin = d["symbol"].replace("USDT", "")
+                    text += f"🔴 *{coin}* — ${float(d['lastPrice']):,.4f} ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
+                safe_edit(cid, mid, text, reply_markup=back_button())
+
+        # ----- Coin Info -----
+        elif data == "menu_info":
+            safe_edit(cid, mid, "🔎 *Coin Info — Select or search:*", reply_markup=info_coins_menu())
+            bot.answer_callback_query(call.id)
+
+        elif data == "search_info":
+            waiting_for[cid] = "info"
+            safe_edit(cid, mid, "🔍 *Type any coin symbol:*\nExample: `PEPE`, `WIF`", reply_markup=back_button())
+            bot.answer_callback_query(call.id)
+
+        elif data.startswith("info_"):
+            symbol = data.split("_")[1]
+            bot.answer_callback_query(call.id, f"Fetching {symbol} info...")
+            info = get_coin_info(symbol)
+            if not info:
+                safe_edit(cid, mid, f"❌ Couldn't fetch info for *{symbol}*.", reply_markup=info_coins_menu())
+            else:
+                supply_str = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
+                max_str = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
+                safe_edit(cid, mid,
+                          f"🔎 *{info['name']} ({info['symbol']})*\n\n"
+                          f"🏆 Rank: #{info['rank']}\n"
+                          f"💵 Price: ${info['price']:,.4f}\n"
+                          f"📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n"
+                          f"📉 From ATH: {info['ath_change']:.2f}%\n"
+                          f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
+                          f"📊 Volume 24h: ${info['volume']:,.0f}\n"
+                          f"🔄 Supply: {supply_str} / {max_str}",
+                          reply_markup=info_coins_menu())
+
+        # ----- Multi Price -----
+        elif data == "menu_multi":
+            safe_edit(cid, mid, "💱 *Multi-Currency Price — Select or search:*", reply_markup=multi_coins_menu())
+            bot.answer_callback_query(call.id)
+
+        elif data == "search_multi":
+            waiting_for[cid] = "multi"
+            safe_edit(cid, mid, "🔍 *Type any coin symbol:*\nExample: `BTC`, `ETH`", reply_markup=back_button())
+            bot.answer_callback_query(call.id)
+
+        elif data.startswith("multi_"):
+            symbol = data.split("_")[1]
+            bot.answer_callback_query(call.id, f"Fetching {symbol} prices...")
+            prices = get_multi_price(symbol)
+            if not prices:
+                safe_edit(cid, mid, f"❌ Couldn't fetch *{symbol}*.", reply_markup=multi_coins_menu())
+            else:
+                flags = {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £", "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ", "try": "🇹🇷 ₺"}
+                text = f"💱 *{symbol} Price*\n\n"
+                for cur, flag in flags.items():
+                    p = prices.get(cur)
+                    if p:
+                        text += f"{flag} {p:,.4f}\n"
+                safe_edit(cid, mid, text, reply_markup=multi_coins_menu())
+
+        # ----- CA Scanner -----
+        elif data == "menu_scan":
+            waiting_for[cid] = "scan"
+            safe_edit(cid, mid,
+                      "🛡 *CA Scanner*\n\nPaste a contract address:\n✅ Supports ETH, BSC, Solana\n\nExample:\n`0x1234...abcd`",
+                      reply_markup=back_button())
+            bot.answer_callback_query(call.id)
 
     except Exception as e:
         print(f"[CALLBACK ERROR] {e}")
@@ -451,13 +668,79 @@ def text_handler(msg):
         return
     mode = waiting_for.pop(cid)
     text = msg.text.strip()
+
     try:
         if mode == "price":
-            show_price(cid, text)
+            stream_price_update(cid, text.upper())
+
+        elif mode == "info":
+            symbol = text.upper()
+            info = get_coin_info(symbol)
+            if not info:
+                safe_send(cid, f"❌ *{symbol}* not found.", reply_markup=info_coins_menu())
+            else:
+                supply_str = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
+                max_str = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
+                safe_send(cid,
+                          f"🔎 *{info['name']} ({info['symbol']})*\n\n"
+                          f"🏆 Rank: #{info['rank']}\n"
+                          f"💵 Price: ${info['price']:,.4f}\n"
+                          f"📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n"
+                          f"📉 From ATH: {info['ath_change']:.2f}%\n"
+                          f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
+                          f"📊 Volume 24h: ${info['volume']:,.0f}\n"
+                          f"🔄 Supply: {supply_str} / {max_str}",
+                          reply_markup=info_coins_menu())
+
+        elif mode == "multi":
+            symbol = text.upper()
+            prices = get_multi_price(symbol)
+            if not prices:
+                safe_send(cid, f"❌ *{symbol}* not found.", reply_markup=multi_coins_menu())
+            else:
+                flags = {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £", "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ", "try": "🇹🇷 ₺"}
+                text_out = f"💱 *{symbol} Price*\n\n"
+                for cur, flag in flags.items():
+                    p = prices.get(cur)
+                    if p:
+                        text_out += f"{flag} {p:,.4f}\n"
+                safe_send(cid, text_out, reply_markup=multi_coins_menu())
+
+        elif mode == "scan":
+            result = scan_ca(text)
+            if not result:
+                safe_send(cid, "❌ Contract not found or unsupported chain.\nSupports ETH, BSC, Solana.", reply_markup=back_button())
+            else:
+                name = result.get("token_name", "Unknown")
+                sym = result.get("token_symbol", "?")
+                hp = result.get("is_honeypot", "?")
+                mint = result.get("is_mintable", "?")
+                proxy = result.get("is_proxy", "?")
+                buy_tax = result.get("buy_tax", "?")
+                sell_tax = result.get("sell_tax", "?")
+                open_source = result.get("is_open_source", "?")
+                holders = result.get("holder_count", "?")
+
+                def flag(v):
+                    if v == "1": return "⚠️ Yes"
+                    if v == "0": return "✅ No"
+                    return "❓ Unknown"
+
+                safe_send(cid,
+                          f"🛡 *CA Scan: {name} ({sym})*\n\n"
+                          f"🍯 Honeypot: {flag(hp)}\n"
+                          f"🖨 Mintable: {flag(mint)}\n"
+                          f"🔁 Proxy: {flag(proxy)}\n"
+                          f"📂 Open Source: {flag(open_source)}\n"
+                          f"💸 Buy Tax: {buy_tax}%\n"
+                          f"💸 Sell Tax: {sell_tax}%\n"
+                          f"👥 Holders: {holders}",
+                          reply_markup=back_button())
+
         elif mode == "alert":
             parts = text.split()
-            if len(parts) != 3:
-                safe_send(cid, "❌ Format:\n`BTC > 100000`")
+            if len(parts) != 3 or parts[1] not in ['>', '<']:
+                safe_send(cid, "❌ Wrong format.\nUse: `BTC > 70000`", reply_markup=alerts_menu())
                 return
             symbol = parts[0].upper()
             direction = parts[1]
@@ -475,13 +758,14 @@ def text_handler(msg):
                 alert_id_counter += 1
             save_alerts()
             ws_restart_required = True
-            safe_send(cid, f"✅ Alert #{current_id} set\n*{symbol}* {direction} *${target:,.2f}*", reply_markup=alerts_menu())
+            safe_send(cid, f"🔔 Alert #{current_id} set!\n*{symbol}* {direction} *${target:,.2f}*", reply_markup=alerts_menu())
+
     except Exception as e:
         print(f"[TEXT ERROR] {e}")
 
 # ================= POLLING =================
 
-print("🚀 Persona V5 running...")
+print("🚀 Persona V5 (Full Edition) running...")
 while True:
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
