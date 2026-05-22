@@ -130,7 +130,7 @@ def get_coin_info(symbol):
         return None
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-        params = {"localization":"false","tickers":"false","community_data":"false"}
+        params = {"localization": "false", "tickers": "false", "community_data": "false"}
         r = requests.get(url, params=params, timeout=10)
         if r.status_code != 200:
             return None
@@ -144,6 +144,9 @@ def get_coin_info(symbol):
             "ath": md["ath"].get("usd", 0),
             "ath_date": md["ath_date"].get("usd", "")[:10],
             "ath_change": md["ath_change_percentage"].get("usd", 0),
+            "atl": md["atl"].get("usd", 0),
+            "atl_date": md["atl_date"].get("usd", "")[:10],
+            "atl_change": md["atl_change_percentage"].get("usd", 0),
             "supply": md.get("circulating_supply", 0),
             "max_supply": md.get("max_supply"),
             "market_cap": md["market_cap"].get("usd", 0),
@@ -475,10 +478,19 @@ def handle_callback(call):
             if not info:
                 send_and_track(cid, f"❌ Couldn't fetch info for *{sym}*.", reply_markup=info_coins_menu())
             else:
-                supply = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
-                max_s = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
+                supply_str = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
+                max_str = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
                 send_and_track(cid,
-                               f"🔎 *{info['name']} ({info['symbol']})*\n\n🏆 Rank: #{info['rank']}\n💵 Price: {format_price(info['price'])}\n📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n📉 From ATH: {info['ath_change']:.2f}%\n💰 Market Cap: ${info['market_cap']:,.0f}\n📊 Volume 24h: ${info['volume']:,.0f}\n🔄 Supply: {supply} / {max_s}",
+                               f"🔎 *{info['name']} ({info['symbol']})*\n\n"
+                               f"🏆 Rank: #{info['rank']}\n"
+                               f"💵 Price: {format_price(info['price'])}\n"
+                               f"📈 ATH: {format_price(info['ath'])} ({info['ath_date']})\n"
+                               f"📉 From ATH: {info['ath_change']:.2f}%\n"
+                               f"📉 ATL: {format_price(info['atl'])} ({info['atl_date']})\n"
+                               f"📈 From ATL: {info['atl_change']:.2f}%\n"
+                               f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
+                               f"📊 Volume 24h: ${info['volume']:,.0f}\n"
+                               f"🔄 Supply: {supply_str} / {max_str}",
                                reply_markup=info_coins_menu())
 
         elif data == "menu_multi":
@@ -537,10 +549,19 @@ def text_input(msg):
             if not info:
                 send_and_track(cid, f"❌ *{text.upper()}* not found.", reply_markup=info_coins_menu())
             else:
-                supply = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
-                max_s = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
+                supply_str = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
+                max_str = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
                 send_and_track(cid,
-                               f"🔎 *{info['name']} ({info['symbol']})*\n\n🏆 Rank: #{info['rank']}\n💵 Price: {format_price(info['price'])}\n📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n📉 From ATH: {info['ath_change']:.2f}%\n💰 Market Cap: ${info['market_cap']:,.0f}\n📊 Volume 24h: ${info['volume']:,.0f}\n🔄 Supply: {supply} / {max_s}",
+                               f"🔎 *{info['name']} ({info['symbol']})*\n\n"
+                               f"🏆 Rank: #{info['rank']}\n"
+                               f"💵 Price: {format_price(info['price'])}\n"
+                               f"📈 ATH: {format_price(info['ath'])} ({info['ath_date']})\n"
+                               f"📉 From ATH: {info['ath_change']:.2f}%\n"
+                               f"📉 ATL: {format_price(info['atl'])} ({info['atl_date']})\n"
+                               f"📈 From ATL: {info['atl_change']:.2f}%\n"
+                               f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
+                               f"📊 Volume 24h: ${info['volume']:,.0f}\n"
+                               f"🔄 Supply: {supply_str} / {max_str}",
                                reply_markup=info_coins_menu())
 
         elif mode == "multi":
@@ -596,7 +617,7 @@ def text_input(msg):
         print(f"Text error: {e}")
 
 # ================= START BOT =================
-print("🚀 Persona — Last 3 messages kept, SHIB price now shows correctly")
+print("🚀 Persona — ATL added, dynamic decimals for all prices")
 while True:
     try:
         bot.infinity_polling(timeout=60)
