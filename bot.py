@@ -14,12 +14,12 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 ALERTS_FILE = "alerts.json"
 CACHE_TTL = 10
-MAX_HISTORY = 3                     # Keep only last 3 messages total
+MAX_HISTORY = 3
 COOLDOWN_SECONDS = 2
 
 PRICE_CACHE = {}
 waiting_for = {}
-user_msg_queue = {}                 # list of message IDs per user (oldest first)
+user_msg_queue = {}
 cooldowns = {}
 ws_restart_required = False
 lock = threading.Lock()
@@ -44,7 +44,6 @@ def save_alerts():
         pass
 
 def cleanup_old_messages(chat_id):
-    """Keep only last MAX_HISTORY messages for this user."""
     if chat_id not in user_msg_queue:
         return
     q = user_msg_queue[chat_id]
@@ -56,7 +55,6 @@ def cleanup_old_messages(chat_id):
             pass
 
 def send_and_track(chat_id, text, reply_markup=None):
-    """Send a new message, track it, and delete if exceeding limit."""
     sent = bot.send_message(chat_id, text, reply_markup=reply_markup)
     if chat_id not in user_msg_queue:
         user_msg_queue[chat_id] = []
@@ -84,6 +82,17 @@ def retry(max_retries=3):
                     time.sleep(1)
         return wrapper
     return decorator
+
+# ================= HELPER: FORMAT PRICE WITH DYNAMIC DECIMALS =================
+def format_price(price):
+    if price >= 1:
+        return f"${price:,.4f}"
+    elif price >= 0.0001:
+        return f"${price:,.6f}"
+    elif price >= 0.000001:
+        return f"${price:,.8f}"
+    else:
+        return f"${price:.10f}"
 
 # ================= API =================
 @retry()
@@ -259,7 +268,7 @@ def check_alerts():
                 for a, price in triggered:
                     label = "🚀 risen above" if a["direction"] == ">" else "📉 dropped below"
                     send_and_track(a["chat_id"],
-                                   f"🔔 *Alert #{a['id']} triggered!*\n\n*{a['coin']}* has {label} *${a['target']:,.2f}*\nCurrent price: *${price:,.4f}*",
+                                   f"🔔 *Alert #{a['id']} triggered!*\n\n*{a['coin']}* has {label} *${a['target']:,.2f}*\nCurrent price: *{format_price(price)}*",
                                    reply_markup=main_menu())
         except Exception as e:
             print(f"Alert error: {e}")
@@ -421,7 +430,8 @@ def handle_callback(call):
                 send_and_track(cid, f"❌ Could not fetch *{sym}*.", reply_markup=price_menu())
             else:
                 arrow = "🟢 ▲" if ch >= 0 else "🔴 ▼"
-                send_and_track(cid, f"*{sym}*\n💵 ${p:,.4f}\n{arrow} {abs(ch):.2f}% (24h)", reply_markup=price_menu())
+                formatted_price = format_price(p)
+                send_and_track(cid, f"*{sym}*\n💵 {formatted_price}\n{arrow} {abs(ch):.2f}% (24h)", reply_markup=price_menu())
 
         elif data == "gainers":
             bot.answer_callback_query(call.id, "Fetching gainers...")
@@ -432,7 +442,8 @@ def handle_callback(call):
                 text = "🚀 *Top 5 Gainers (24h)*\n\n"
                 for d in g:
                     coin = d["symbol"].replace("USDT", "")
-                    text += f"🟢 *{coin}* — ${float(d['lastPrice']):,.4f} ▲ {float(d['priceChangePercent']):.2f}%\n"
+                    p = float(d['lastPrice'])
+                    text += f"🟢 *{coin}* — {format_price(p)} ▲ {float(d['priceChangePercent']):.2f}%\n"
                 send_and_track(cid, text, reply_markup=back_button())
 
         elif data == "losers":
@@ -444,7 +455,8 @@ def handle_callback(call):
                 text = "📉 *Top 5 Losers (24h)*\n\n"
                 for d in l:
                     coin = d["symbol"].replace("USDT", "")
-                    text += f"🔴 *{coin}* — ${float(d['lastPrice']):,.4f} ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
+                    p = float(d['lastPrice'])
+                    text += f"🔴 *{coin}* — {format_price(p)} ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
                 send_and_track(cid, text, reply_markup=back_button())
 
         elif data == "menu_info":
@@ -466,7 +478,7 @@ def handle_callback(call):
                 supply = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
                 max_s = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
                 send_and_track(cid,
-                               f"🔎 *{info['name']} ({info['symbol']})*\n\n🏆 Rank: #{info['rank']}\n💵 Price: ${info['price']:,.4f}\n📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n📉 From ATH: {info['ath_change']:.2f}%\n💰 Market Cap: ${info['market_cap']:,.0f}\n📊 Volume 24h: ${info['volume']:,.0f}\n🔄 Supply: {supply} / {max_s}",
+                               f"🔎 *{info['name']} ({info['symbol']})*\n\n🏆 Rank: #{info['rank']}\n💵 Price: {format_price(info['price'])}\n📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n📉 From ATH: {info['ath_change']:.2f}%\n💰 Market Cap: ${info['market_cap']:,.0f}\n📊 Volume 24h: ${info['volume']:,.0f}\n🔄 Supply: {supply} / {max_s}",
                                reply_markup=info_coins_menu())
 
         elif data == "menu_multi":
@@ -490,7 +502,7 @@ def handle_callback(call):
                 for cur, flag in flags.items():
                     p = prices.get(cur)
                     if p:
-                        text += f"{flag} {p:,.4f}\n"
+                        text += f"{flag} {format_price(p)}\n"
                 send_and_track(cid, text, reply_markup=multi_coins_menu())
 
         elif data == "menu_scan":
@@ -517,7 +529,8 @@ def text_input(msg):
                 send_and_track(cid, f"❌ Could not fetch *{text.upper()}*.", reply_markup=price_menu())
             else:
                 arrow = "🟢 ▲" if ch >= 0 else "🔴 ▼"
-                send_and_track(cid, f"*{text.upper()}*\n💵 ${p:,.4f}\n{arrow} {abs(ch):.2f}% (24h)", reply_markup=price_menu())
+                formatted_price = format_price(p)
+                send_and_track(cid, f"*{text.upper()}*\n💵 {formatted_price}\n{arrow} {abs(ch):.2f}% (24h)", reply_markup=price_menu())
 
         elif mode == "info":
             info = get_coin_info(text.upper())
@@ -527,7 +540,7 @@ def text_input(msg):
                 supply = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
                 max_s = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
                 send_and_track(cid,
-                               f"🔎 *{info['name']} ({info['symbol']})*\n\n🏆 Rank: #{info['rank']}\n💵 Price: ${info['price']:,.4f}\n📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n📉 From ATH: {info['ath_change']:.2f}%\n💰 Market Cap: ${info['market_cap']:,.0f}\n📊 Volume 24h: ${info['volume']:,.0f}\n🔄 Supply: {supply} / {max_s}",
+                               f"🔎 *{info['name']} ({info['symbol']})*\n\n🏆 Rank: #{info['rank']}\n💵 Price: {format_price(info['price'])}\n📈 ATH: ${info['ath']:,.4f} ({info['ath_date']})\n📉 From ATH: {info['ath_change']:.2f}%\n💰 Market Cap: ${info['market_cap']:,.0f}\n📊 Volume 24h: ${info['volume']:,.0f}\n🔄 Supply: {supply} / {max_s}",
                                reply_markup=info_coins_menu())
 
         elif mode == "multi":
@@ -540,7 +553,7 @@ def text_input(msg):
                 for cur, flag in flags.items():
                     p = prices.get(cur)
                     if p:
-                        out += f"{flag} {p:,.4f}\n"
+                        out += f"{flag} {format_price(p)}\n"
                 send_and_track(cid, out, reply_markup=multi_coins_menu())
 
         elif mode == "scan":
@@ -583,7 +596,7 @@ def text_input(msg):
         print(f"Text error: {e}")
 
 # ================= START BOT =================
-print("🚀 Persona — Last 3 messages kept, automatic cleanup of older messages")
+print("🚀 Persona — Last 3 messages kept, SHIB price now shows correctly")
 while True:
     try:
         bot.infinity_polling(timeout=60)
