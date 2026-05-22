@@ -1,2 +1,5 @@
 pyTelegramBotAPI
 requests
+aiohttp
+websockets
+aiosqlite
