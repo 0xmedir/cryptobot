@@ -26,7 +26,7 @@ COOLDOWN_SECONDS = 2
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
 MAX_TEXT_LEN = 200
-MAX_HISTORY = 3                     # keep last 3 bot messages
+MAX_HISTORY = 3
 
 logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s', level=logging.INFO)
 log = logging.getLogger("PersonaBot")
@@ -313,7 +313,7 @@ def get_alert_count(chat_id):
     row = db_query("SELECT COUNT(*) FROM alerts WHERE active=1 AND chat_id=?", (chat_id,), fetch_one=True)
     return row[0] if row else 0
 
-# ================= WEBSOCKET (real‑time prices) =================
+# ================= WEBSOCKET =================
 ws_stop = False
 ws_lock = threading.RLock()
 last_symbols = set()
@@ -400,15 +400,29 @@ def fmt_price(p):
         return f"${p:,.8f}"
     return f"${p:.10f}"
 
+def fmt_currency_value(currency_code, value):
+    """Return formatted price with proper currency symbol."""
+    if value is None:
+        return "N/A"
+    symbols = {
+        "usd": "$", "eur": "€", "gbp": "£", "jpy": "¥",
+        "cny": "¥", "aed": "د.إ", "try": "₺"
+    }
+    symbol = symbols.get(currency_code, "")
+    if currency_code == "aed":
+        return f"{symbol} {value:,.2f}"
+    if value >= 1:
+        return f"{symbol}{value:,.2f}"
+    return f"{symbol}{value:.8f}"
+
 def escape_md(t):
     return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', t)
 
-# ================= MESSAGE QUEUE (keep last 3 bot messages) =================
+# ================= MESSAGE QUEUE =================
 msg_queue = {}
 q_lock = threading.RLock()
 
 def send_and_track(chat_id, text, markup=None):
-    """Send a new message, track it, delete oldest if exceeding MAX_HISTORY."""
     sent = bot.send_message(chat_id, text, reply_markup=markup)
     with q_lock:
         if chat_id not in msg_queue:
@@ -571,7 +585,6 @@ def cb(call):
     log_interaction(uid, call.from_user.username, call.from_user.first_name, f"cb:{data[:30]}")
 
     try:
-        # Navigation – send new message (no editing)
         if data == "back_main":
             with wait_lock:
                 waiting.pop(cid, None)
@@ -683,12 +696,13 @@ def cb(call):
                 send_and_track(cid, f"❌ No info for {sym}", info_menu()[1])
             else:
                 text = (f"🔎 *{info['name']} ({info['symbol']})*\n{sep()}\n"
-                        f"Rank: #{info['rank']}\n"
-                        f"Price: {fmt_price(info['price'])}\n"
-                        f"ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
-                        f"ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
-                        f"Market Cap: ${info['market_cap']:,.0f}\n"
-                        f"Volume: ${info['volume']:,.0f}")
+                        f"🏆 Rank: #{info['rank']}\n"
+                        f"💰 Price: {fmt_price(info['price'])}\n"
+                        f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+                        f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+                        f"💹 Market Cap: ${info['market_cap']:,.0f}\n"
+                        f"📊 Volume: ${info['volume']:,.0f}\n"
+                        f"🔄 Supply: {info['supply']:,.0f} / {info['max_supply'] if info['max_supply'] else '∞'}")
                 send_and_track(cid, text, info_menu()[1])
         elif data == "menu_multi":
             text, kb = multi_menu()
@@ -703,12 +717,21 @@ def cb(call):
             if not prices:
                 send_and_track(cid, f"❌ No data for {sym}", multi_menu()[1])
             else:
-                flags = {"usd":"🇺🇸","eur":"🇪🇺","gbp":"🇬🇧","jpy":"🇯🇵","cny":"🇨🇳","aed":"🇦🇪","try":"🇹🇷"}
-                text = f"💱 {sym}\n{sep()}\n"
-                for cur, flag in flags.items():
-                    p = prices.get(cur)
-                    if p:
-                        text += f"{flag} {fmt_price(p)}\n"
+                cur_map = {
+                    "usd": ("🇺🇸 USD", "usd"),
+                    "eur": ("🇪🇺 EUR", "eur"),
+                    "gbp": ("🇬🇧 GBP", "gbp"),
+                    "jpy": ("🇯🇵 JPY", "jpy"),
+                    "cny": ("🇨🇳 CNY", "cny"),
+                    "aed": ("🇦🇪 AED", "aed"),
+                    "try": ("🇹🇷 TRY", "try")
+                }
+                text = f"💱 *{sym} Multi‑Currency*\n{sep()}\n"
+                for key, (flag, code) in cur_map.items():
+                    val = prices.get(key)
+                    if val is not None:
+                        formatted = fmt_currency_value(key, val)
+                        text += f"{flag} {formatted}\n"
                 send_and_track(cid, text, multi_menu()[1])
         elif data == "menu_scan":
             with wait_lock:
@@ -717,10 +740,10 @@ def cb(call):
         elif data == "profile":
             p = get_profile(uid)
             text = (f"👤 Profile\n{sep()}\n"
-                    f"Streak: {p['streak']} days\n"
-                    f"Interactions: {p['total_interactions']}\n"
-                    f"Alerts set: {p['alerts_set']}\n"
-                    f"Alerts triggered: {p['alerts_triggered']}")
+                    f"🔥 Streak: {p['streak']} days\n"
+                    f"💬 Interactions: {p['total_interactions']}\n"
+                    f"🔔 Alerts set: {p['alerts_set']}\n"
+                    f"⚡ Alerts triggered: {p['alerts_triggered']}")
             send_and_track(cid, text, back_button())
         else:
             pass
@@ -728,7 +751,7 @@ def cb(call):
         log.error(f"Callback error: {e}", exc_info=True)
         send_and_track(cid, "⚠️ Error", back_button())
 
-# ================= TEXT HANDLER (with user message deletion) =================
+# ================= TEXT HANDLER =================
 @bot.message_handler(func=lambda m: True)
 def text_input(m):
     cid = m.chat.id
@@ -744,10 +767,10 @@ def text_input(m):
     if not t:
         return
 
-    # Try to delete the user's message (works only in groups where bot is admin)
+    # Delete user's message (works in groups where bot is admin)
     try:
         bot.delete_message(cid, m.message_id)
-    except Exception:
+    except:
         pass
 
     log_interaction(uid, m.from_user.username, m.from_user.first_name, f"text:{mode}", t)
@@ -767,24 +790,34 @@ def text_input(m):
                 send_and_track(cid, f"❌ {escape_md(t)} not found", info_menu()[1])
             else:
                 text = (f"🔎 *{info['name']} ({info['symbol']})*\n{sep()}\n"
-                        f"Rank: #{info['rank']}\n"
-                        f"Price: {fmt_price(info['price'])}\n"
-                        f"ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
-                        f"ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
-                        f"Market Cap: ${info['market_cap']:,.0f}\n"
-                        f"Volume: ${info['volume']:,.0f}")
+                        f"🏆 Rank: #{info['rank']}\n"
+                        f"💰 Price: {fmt_price(info['price'])}\n"
+                        f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+                        f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+                        f"💹 Market Cap: ${info['market_cap']:,.0f}\n"
+                        f"📊 Volume: ${info['volume']:,.0f}\n"
+                        f"🔄 Supply: {info['supply']:,.0f} / {info['max_supply'] if info['max_supply'] else '∞'}")
                 send_and_track(cid, text, info_menu()[1])
         elif mode == "multi":
             prices = CoinGecko.multi_price(t.upper())
             if not prices:
                 send_and_track(cid, f"❌ {escape_md(t)} not found", multi_menu()[1])
             else:
-                flags = {"usd":"🇺🇸","eur":"🇪🇺","gbp":"🇬🇧","jpy":"🇯🇵","cny":"🇨🇳","aed":"🇦🇪","try":"🇹🇷"}
-                text = f"💱 {escape_md(t)}\n{sep()}\n"
-                for cur, flag in flags.items():
-                    p = prices.get(cur)
-                    if p:
-                        text += f"{flag} {fmt_price(p)}\n"
+                cur_map = {
+                    "usd": ("🇺🇸 USD", "usd"),
+                    "eur": ("🇪🇺 EUR", "eur"),
+                    "gbp": ("🇬🇧 GBP", "gbp"),
+                    "jpy": ("🇯🇵 JPY", "jpy"),
+                    "cny": ("🇨🇳 CNY", "cny"),
+                    "aed": ("🇦🇪 AED", "aed"),
+                    "try": ("🇹🇷 TRY", "try")
+                }
+                text = f"💱 *{escape_md(t)} Multi‑Currency*\n{sep()}\n"
+                for key, (flag, code) in cur_map.items():
+                    val = prices.get(key)
+                    if val is not None:
+                        formatted = fmt_currency_value(key, val)
+                        text += f"{flag} {formatted}\n"
                 send_and_track(cid, text, multi_menu()[1])
         elif mode == "scan":
             result, err = ContractScanner.scan(t)
@@ -839,6 +872,6 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Persona Bot – No editing, keeps last 3 bot messages, deletes user message (group admin)")
+log.info("🚀 Persona Bot – Final: Fixed Multi‑Currency & Info Layout")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
