@@ -822,11 +822,11 @@ def text_input(msg):
             if not prices:
                 send_and_track(cid, f"❌ *{text.upper()}* not found.", reply_markup=multi_coins_menu())
             else:
-                flags = {
-                    "usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £",
+                flags =
+                    {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £",
                     "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ",
-                    "try": "🇹🇷 ₺", "etb": "🇪🇹 Br"
-                }
+                    "try": "🇹🇷 ₺"}
+
                 out = f"💱 *{text.upper()} Price*\n\n"
                 for cur, flag in flags.items():
                     p = prices.get(cur)
