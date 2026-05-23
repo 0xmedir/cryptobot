@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Focused: Alerts, Price Tools, Scanner (Improved)
+Persona Bot – Final Production Version
+No leaderboard, no unknown commands, proper callback_data usage.
 """
 
 import telebot
@@ -216,61 +217,50 @@ class CoinGecko:
         except:
             return None
 
-# ================= IMPROVED CONTRACT SCANNER =================
-class GoPlus:
+# ================= ROBUST CONTRACT SCANNER =================
+class ContractScanner:
     @staticmethod
     def scan(address):
-        if len(address) > MAX_CA_LENGTH:
+        if not address:
+            return None, "Empty address"
+        addr = re.sub(r'\s+', '', address)
+        if len(addr) > MAX_CA_LENGTH:
             return None, "Address too long"
-
-        # Normalise address
-        orig = address
-        address = address.strip()
-        # Keep original case? GoPlus expects lowercase
-        address_lower = address.lower()
-        # Remove any non-hex characters (except 0x)
-        clean = re.sub(r'[^a-f0-9]', '', address_lower)
-        if address_lower.startswith("0x"):
-            clean = "0x" + clean
+        addr_lower = addr.lower()
+        # Ethereum/BSC address pattern
+        if re.match(r'^0x[a-f0-9]{40}$', addr_lower):
+            for chain in [1, 56]:
+                for attempt in range(2):
+                    try:
+                        url = f"https://api.gopluslabs.io/api/v1/token_security/{chain}?contract_addresses={addr_lower}"
+                        r = session.get(url, timeout=15)
+                        if r.status_code == 200:
+                            data = r.json()
+                            result = data.get("result", {}).get(addr_lower, {})
+                            if result:
+                                return result, None
+                        time.sleep(0.5)
+                    except Exception as e:
+                        log.error(f"GoPlus chain {chain}: {e}")
+            return None, "Contract not found on Ethereum/BSC"
         else:
-            # Solana addresses are base58, keep as is but clean
-            clean = re.sub(r'[^a-zA-Z0-9]', '', address)
-
-        # Rate limit protection: wait a bit before hitting the API
-        time.sleep(0.3)
-
-        try:
-            if clean.startswith("0x") and len(clean) == 42:
-                # Try Ethereum first
-                url = f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={clean}"
-                r = session.get(url, timeout=15)
-                if r.status_code == 200:
-                    data = r.json()
-                    result = data.get("result", {}).get(clean, {})
-                    if result:
-                        return result, None
-                    # Try BSC
-                    url = f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={clean}"
+            # Solana: clean and validate length
+            sol_addr = re.sub(r'[^a-zA-Z0-9]', '', addr)
+            if len(sol_addr) < 32 or len(sol_addr) > 44:
+                return None, "Invalid Solana address length"
+            for attempt in range(2):
+                try:
+                    url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={sol_addr}"
                     r = session.get(url, timeout=15)
                     if r.status_code == 200:
                         data = r.json()
-                        result = data.get("result", {}).get(clean, {})
+                        result = data.get("result", {}).get(sol_addr, {})
                         if result:
                             return result, None
-                return None, "Contract not found on Ethereum or BSC (check address)"
-            else:
-                # Solana (GoPlus supports)
-                url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={clean}"
-                r = session.get(url, timeout=15)
-                if r.status_code == 200:
-                    data = r.json()
-                    result = data.get("result", {}).get(clean, {})
-                    if result:
-                        return result, None
-                return None, "Solana token not found or not verified"
-        except Exception as e:
-            log.error(f"GoPlus scan error: {e}")
-            return None, "API error – try again later"
+                    time.sleep(0.5)
+                except Exception as e:
+                    log.error(f"GoPlus Solana: {e}")
+            return None, "Solana token not found"
 
 # ================= USER PROFILES =================
 def get_profile(user_id):
@@ -398,15 +388,29 @@ def separator(): return "━━━━━━━━━━━━━━━━━━�
 def fmt_price(p): return f"${p:,.4f}" if p>=1 else f"${p:,.6f}" if p>=0.0001 else f"${p:,.8f}" if p>=1e-6 else f"${p:.10f}"
 def escape_md(t): return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', t)
 
-# ================= KEYBOARDS =================
+# ================= KEYBOARDS (all using callback_data) =================
 def main_menu():
     text = f"`{separator()}`\n🤖 **PERSONA**\n`{separator()}`"
     kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("💰 Price", callback_data="menu_price"), InlineKeyboardButton("🔔 Alerts", callback_data="menu_alerts"))
-    kb.row(InlineKeyboardButton("🚀 Gainers", callback_data="gainers"), InlineKeyboardButton("📉 Losers", callback_data="losers"))
-    kb.row(InlineKeyboardButton("🔎 Coin Info", callback_data="menu_info"), InlineKeyboardButton("💱 Multi", callback_data="menu_multi"))
-    kb.row(InlineKeyboardButton("🛡 Scan", callback_data="menu_scan"), InlineKeyboardButton("📋 My Alerts", callback_data="list_alerts"))
-    kb.row(InlineKeyboardButton("📈 Profile", callback_data="profile"))
+    kb.row(
+        InlineKeyboardButton("💰 Price", callback_data="menu_price"),
+        InlineKeyboardButton("🔔 Alerts", callback_data="menu_alerts")
+    )
+    kb.row(
+        InlineKeyboardButton("🚀 Gainers", callback_data="gainers"),
+        InlineKeyboardButton("📉 Losers", callback_data="losers")
+    )
+    kb.row(
+        InlineKeyboardButton("🔎 Coin Info", callback_data="menu_info"),
+        InlineKeyboardButton("💱 Multi", callback_data="menu_multi")
+    )
+    kb.row(
+        InlineKeyboardButton("🛡 Scan", callback_data="menu_scan"),
+        InlineKeyboardButton("📋 My Alerts", callback_data="list_alerts")
+    )
+    kb.row(
+        InlineKeyboardButton("📈 Profile", callback_data="profile")
+    )
     return text, kb
 
 def price_menu():
@@ -416,8 +420,11 @@ def price_menu():
     row = []
     for i,c in enumerate(coins,1):
         row.append(InlineKeyboardButton(c, callback_data=f"price_{c}"))
-        if i%3==0: kb.row(*row); row=[]
-    if row: kb.row(*row)
+        if i%3==0:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
     kb.row(InlineKeyboardButton("🔍 Search", callback_data="search_coin"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
@@ -425,9 +432,18 @@ def price_menu():
 def alerts_menu():
     text = f"`{separator()}`\n🔔 **Alerts**\n`{separator()}`"
     kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("BTC >100k", "setalert_BTC_>_100000"), InlineKeyboardButton("BTC <80k", "setalert_BTC_<_80000"))
-    kb.row(InlineKeyboardButton("ETH >4k", "setalert_ETH_>_4000"), InlineKeyboardButton("ETH <2k", "setalert_ETH_<_2000"))
-    kb.row(InlineKeyboardButton("SOL >200", "setalert_SOL_>_200"), InlineKeyboardButton("SOL <100", "setalert_SOL_<_100"))
+    kb.row(
+        InlineKeyboardButton("BTC >100k", callback_data="setalert_BTC_>_100000"),
+        InlineKeyboardButton("BTC <80k", callback_data="setalert_BTC_<_80000")
+    )
+    kb.row(
+        InlineKeyboardButton("ETH >4k", callback_data="setalert_ETH_>_4000"),
+        InlineKeyboardButton("ETH <2k", callback_data="setalert_ETH_<_2000")
+    )
+    kb.row(
+        InlineKeyboardButton("SOL >200", callback_data="setalert_SOL_>_200"),
+        InlineKeyboardButton("SOL <100", callback_data="setalert_SOL_<_100")
+    )
     kb.row(InlineKeyboardButton("✏️ Custom", callback_data="custom_alert"))
     kb.row(InlineKeyboardButton("📋 My Alerts", callback_data="list_alerts"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
@@ -436,8 +452,21 @@ def alerts_menu():
 def info_menu():
     text = f"`{separator()}`\n🔎 **Coin Info**\n`{separator()}`"
     kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("BTC", "info_BTC"), InlineKeyboardButton("ETH", "info_ETH"), InlineKeyboardButton("BNB", "info_BNB"))
-    kb.row(InlineKeyboardButton("SOL", "info_SOL"), InlineKeyboardButton("XRP", "info_XRP"), InlineKeyboardButton("ADA", "info_ADA"))
+    kb.row(
+        InlineKeyboardButton("BTC", callback_data="info_BTC"),
+        InlineKeyboardButton("ETH", callback_data="info_ETH"),
+        InlineKeyboardButton("BNB", callback_data="info_BNB")
+    )
+    kb.row(
+        InlineKeyboardButton("SOL", callback_data="info_SOL"),
+        InlineKeyboardButton("XRP", callback_data="info_XRP"),
+        InlineKeyboardButton("ADA", callback_data="info_ADA")
+    )
+    kb.row(
+        InlineKeyboardButton("DOGE", callback_data="info_DOGE"),
+        InlineKeyboardButton("AVAX", callback_data="info_AVAX"),
+        InlineKeyboardButton("LINK", callback_data="info_LINK")
+    )
     kb.row(InlineKeyboardButton("🔍 Search", callback_data="search_info"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
@@ -445,7 +474,16 @@ def info_menu():
 def multi_menu():
     text = f"`{separator()}`\n💱 **Multi‑Currency**\n`{separator()}`"
     kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("BTC", "multi_BTC"), InlineKeyboardButton("ETH", "multi_ETH"), InlineKeyboardButton("BNB", "multi_BNB"))
+    kb.row(
+        InlineKeyboardButton("BTC", callback_data="multi_BTC"),
+        InlineKeyboardButton("ETH", callback_data="multi_ETH"),
+        InlineKeyboardButton("BNB", callback_data="multi_BNB")
+    )
+    kb.row(
+        InlineKeyboardButton("SOL", callback_data="multi_SOL"),
+        InlineKeyboardButton("XRP", callback_data="multi_XRP"),
+        InlineKeyboardButton("ADA", callback_data="multi_ADA")
+    )
     kb.row(InlineKeyboardButton("🔍 Search", callback_data="search_multi"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
@@ -472,16 +510,19 @@ q_lock = threading.RLock()
 def send_and_track(cid, text, markup=None):
     sent = bot.send_message(cid, text, reply_markup=markup)
     with q_lock:
-        if cid not in msg_queue: msg_queue[cid]=[]
+        if cid not in msg_queue:
+            msg_queue[cid] = []
         msg_queue[cid].append(sent.message_id)
         if len(msg_queue[cid]) > MAX_HISTORY:
             old = msg_queue[cid].pop(0)
-            try: bot.delete_message(cid, old)
-            except: pass
+            try:
+                bot.delete_message(cid, old)
+            except:
+                pass
     return sent
 
 # ================= COMMANDS =================
-@bot.message_handler(commands=["start","help"])
+@bot.message_handler(commands=["start", "help"])
 def start(m):
     log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
     text, kb = main_menu()
@@ -489,64 +530,83 @@ def start(m):
 
 @bot.message_handler(commands=["stats"])
 def stats(m):
-    if not is_admin(m.from_user.id): return
+    if not is_admin(m.from_user.id):
+        return
     users = db_query("SELECT COUNT(DISTINCT user_id) FROM analytics", fetch_one=True)[0]
     interactions = db_query("SELECT COUNT(*) FROM analytics", fetch_one=True)[0]
-    alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
-    send_and_track(m.chat.id, f"📊 Stats\nUsers: {users}\nInteractions: {interactions}\nActive alerts: {alerts}", back_button())
+    active_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
+    send_and_track(m.chat.id, f"📊 Stats\nUsers: {users}\nInteractions: {interactions}\nActive alerts: {active_alerts}", back_button())
+
+# ignore any other commands
+@bot.message_handler(func=lambda m: True)
+def unknown_command(m):
+    send_and_track(m.chat.id, "❌ Unknown command. Use /start")
 
 # ================= CALLBACKS =================
 waiting = {}
 wait_lock = threading.RLock()
 
-@bot.callback_query_handler(func=lambda c: True)
-def cb(c):
-    uid = c.from_user.id
-    cid = c.message.chat.id
-    data = c.data
+@bot.callback_query_handler(func=lambda call: True)
+def cb(call):
+    uid = call.from_user.id
+    cid = call.message.chat.id
+    data = call.data
 
     if not cooldown_ok(uid):
-        bot.answer_callback_query(c.id, "Slow down")
+        bot.answer_callback_query(call.id, "Slow down")
         return
-    bot.answer_callback_query(c.id)
-    log_interaction(uid, c.from_user.username, c.from_user.first_name, f"cb:{data[:30]}")
+    bot.answer_callback_query(call.id)
+    log_interaction(uid, call.from_user.username, call.from_user.first_name, f"cb:{data[:30]}")
 
     try:
         if data == "back_main":
-            with wait_lock: waiting.pop(cid, None)
-            text,kb = main_menu()
+            with wait_lock:
+                waiting.pop(cid, None)
+            text, kb = main_menu()
             send_and_track(cid, text, kb)
         elif data == "menu_price":
-            text,kb = price_menu()
+            text, kb = price_menu()
             send_and_track(cid, text, kb)
         elif data == "search_coin":
-            with wait_lock: waiting[cid] = "price"
+            with wait_lock:
+                waiting[cid] = "price"
             send_and_track(cid, "🔍 Type coin symbol (e.g., PEPE)", back_button())
         elif data == "menu_alerts":
-            text,kb = alerts_menu()
+            text, kb = alerts_menu()
             send_and_track(cid, text, kb)
         elif data == "custom_alert":
-            with wait_lock: waiting[cid] = "alert"
+            with wait_lock:
+                waiting[cid] = "alert"
             send_and_track(cid, "✏️ Format: COIN > price\nExample: BTC > 95000", back_button())
         elif data.startswith("setalert_"):
             parts = data.split("_")
-            if len(parts)!=4: return
-            _, sym, dir_op, t = parts
-            try: target = float(t)
-            except: send_and_track(cid, "❌ Invalid price", alerts_menu()[1]); return
-            p,_ = Binance.price(sym)
-            if p is None: send_and_track(cid, f"❌ {sym} not found", alerts_menu()[1]); return
-            if get_alert_count(cid) >= MAX_ALERTS_PER_USER: send_and_track(cid, f"❌ Max {MAX_ALERTS_PER_USER} alerts", alerts_menu()[1]); return
-            aid = add_alert(cid, sym, target, dir_op)
+            if len(parts) != 4:
+                return
+            _, sym, direction, t = parts
+            try:
+                target = float(t)
+            except:
+                send_and_track(cid, "❌ Invalid price", alerts_menu()[1])
+                return
+            p, _ = Binance.price(sym)
+            if p is None:
+                send_and_track(cid, f"❌ {sym} not found", alerts_menu()[1])
+                return
+            if get_alert_count(cid) >= MAX_ALERTS_PER_USER:
+                send_and_track(cid, f"❌ Max {MAX_ALERTS_PER_USER} alerts", alerts_menu()[1])
+                return
+            aid = add_alert(cid, sym, target, direction)
             rebuild_ws()
-            send_and_track(cid, f"✅ Alert #{aid} set!\n{sym} {dir_op} ${target:,.2f}", alerts_menu()[1])
+            send_and_track(cid, f"✅ Alert #{aid} set!\n{sym} {direction} ${target:,.2f}", alerts_menu()[1])
         elif data == "list_alerts":
             active = get_active_alerts(cid)
-            if not active: send_and_track(cid, "📋 No active alerts", alerts_menu()[1]); return
-            text = "📋 *Active Alerts*\n"+separator()+"\n"
+            if not active:
+                send_and_track(cid, "📋 No active alerts", alerts_menu()[1])
+                return
+            text = "📋 *Active Alerts*\n" + separator() + "\n"
             kb = InlineKeyboardMarkup()
             for a in active:
-                label = "▲" if a["direction"]==">" else "▼"
+                label = "▲" if a["direction"] == ">" else "▼"
                 text += f"#{a['id']} {a['coin']} {label} ${a['target']:,.2f}\n"
                 kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
             kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
@@ -556,142 +616,192 @@ def cb(c):
             deactivate_alert(aid)
             rebuild_ws()
             active = get_active_alerts(cid)
-            if not active: send_and_track(cid, "📋 No active alerts", back_button())
+            if not active:
+                send_and_track(cid, "📋 No active alerts", back_button())
             else:
-                text = "📋 *Active Alerts*\n"+separator()+"\n"
+                text = "📋 *Active Alerts*\n" + separator() + "\n"
                 kb = InlineKeyboardMarkup()
                 for a in active:
-                    label = "▲" if a["direction"]==">" else "▼"
+                    label = "▲" if a["direction"] == ">" else "▼"
                     text += f"#{a['id']} {a['coin']} {label} ${a['target']:,.2f}\n"
                     kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
                 kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
                 send_and_track(cid, text, kb)
         elif data.startswith("price_"):
             sym = data.split("_")[1]
-            p,ch = Binance.price(sym)
-            if p is None: send_and_track(cid, f"❌ {sym} not found", price_menu()[1])
+            p, ch = Binance.price(sym)
+            if p is None:
+                send_and_track(cid, f"❌ {sym} not found", price_menu()[1])
             else:
-                arrow = "🟢▲" if ch>=0 else "🔴▼"
+                arrow = "🟢▲" if ch >= 0 else "🔴▼"
                 send_and_track(cid, f"*{sym}*\n{fmt_price(p)}\n{arrow} {abs(ch):.2f}%", price_menu()[1])
         elif data == "gainers":
-            g,_ = Binance.top_movers()
-            if not g: send_and_track(cid, "❌ No data", back_button())
+            g, _ = Binance.top_movers()
+            if not g:
+                send_and_track(cid, "❌ No data", back_button())
             else:
-                text = "🚀 *Gainers*\n"+separator()+"\n"
+                text = "🚀 *Gainers*\n" + separator() + "\n"
                 for d in g:
-                    c = d["symbol"].replace("USDT","")
-                    text += f"🟢 {c} {fmt_price(float(d['lastPrice']))} ▲ {float(d['priceChangePercent']):.2f}%\n"
+                    coin = d["symbol"].replace("USDT", "")
+                    text += f"🟢 {coin} {fmt_price(float(d['lastPrice']))} ▲ {float(d['priceChangePercent']):.2f}%\n"
                 send_and_track(cid, text, back_button())
         elif data == "losers":
-            _,l = Binance.top_movers()
-            if not l: send_and_track(cid, "❌ No data", back_button())
+            _, l = Binance.top_movers()
+            if not l:
+                send_and_track(cid, "❌ No data", back_button())
             else:
-                text = "📉 *Losers*\n"+separator()+"\n"
+                text = "📉 *Losers*\n" + separator() + "\n"
                 for d in l:
-                    c = d["symbol"].replace("USDT","")
-                    text += f"🔴 {c} {fmt_price(float(d['lastPrice']))} ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
+                    coin = d["symbol"].replace("USDT", "")
+                    text += f"🔴 {coin} {fmt_price(float(d['lastPrice']))} ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
                 send_and_track(cid, text, back_button())
         elif data == "menu_info":
-            text,kb = info_menu()
+            text, kb = info_menu()
             send_and_track(cid, text, kb)
         elif data == "search_info":
-            with wait_lock: waiting[cid] = "info"
+            with wait_lock:
+                waiting[cid] = "info"
             send_and_track(cid, "🔍 Enter coin symbol", back_button())
         elif data.startswith("info_"):
             sym = data.split("_")[1]
             info = CoinGecko.info(sym)
-            if not info: send_and_track(cid, f"❌ No info for {sym}", info_menu()[1])
+            if not info:
+                send_and_track(cid, f"❌ No info for {sym}", info_menu()[1])
             else:
-                text = f"🔎 {info['name']} ({info['symbol']})\n{separator()}\nRank: {info['rank']}\nPrice: {fmt_price(info['price'])}\nATH: {fmt_price(info['ath'])} ({info['ath_date']})\nATL: {fmt_price(info['atl'])} ({info['atl_date']})\nMarket Cap: ${info['market_cap']:,.0f}\nVolume: ${info['volume']:,.0f}"
+                text = (f"🔎 {info['name']} ({info['symbol']})\n{separator()}\n"
+                        f"Rank: #{info['rank']}\nPrice: {fmt_price(info['price'])}\n"
+                        f"ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+                        f"ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+                        f"Market Cap: ${info['market_cap']:,.0f}\nVolume: ${info['volume']:,.0f}")
                 send_and_track(cid, text, info_menu()[1])
         elif data == "menu_multi":
-            text,kb = multi_menu()
+            text, kb = multi_menu()
             send_and_track(cid, text, kb)
         elif data == "search_multi":
-            with wait_lock: waiting[cid] = "multi"
+            with wait_lock:
+                waiting[cid] = "multi"
             send_and_track(cid, "🔍 Enter coin symbol", back_button())
         elif data.startswith("multi_"):
             sym = data.split("_")[1]
             prices = CoinGecko.multi_price(sym)
-            if not prices: send_and_track(cid, f"❌ No data for {sym}", multi_menu()[1])
+            if not prices:
+                send_and_track(cid, f"❌ No data for {sym}", multi_menu()[1])
             else:
                 flags = {"usd":"🇺🇸","eur":"🇪🇺","gbp":"🇬🇧","jpy":"🇯🇵","cny":"🇨🇳","aed":"🇦🇪","try":"🇹🇷"}
                 text = f"💱 {sym}\n{separator()}\n"
-                for cur,flag in flags.items():
+                for cur, flag in flags.items():
                     p = prices.get(cur)
-                    if p: text += f"{flag} {fmt_price(p)}\n"
+                    if p:
+                        text += f"{flag} {fmt_price(p)}\n"
                 send_and_track(cid, text, multi_menu()[1])
         elif data == "menu_scan":
-            with wait_lock: waiting[cid] = "scan"
+            with wait_lock:
+                waiting[cid] = "scan"
             send_and_track(cid, "🛡 Paste contract address (ETH/BSC/Solana)", back_button())
         elif data == "profile":
             p = get_profile(uid)
-            text = f"👤 Profile\n{separator()}\nStreak: {p['streak']} days\nInteractions: {p['total_interactions']}\nAlerts set: {p['alerts_set']}\nAlerts triggered: {p['alerts_triggered']}"
+            text = (f"👤 Profile\n{separator()}\n"
+                    f"Streak: {p['streak']} days\n"
+                    f"Interactions: {p['total_interactions']}\n"
+                    f"Alerts set: {p['alerts_set']}\n"
+                    f"Alerts triggered: {p['alerts_triggered']}")
             send_and_track(cid, text, back_button())
+        else:
+            # unknown callback – ignore
+            pass
     except Exception as e:
         log.error(f"Callback error: {e}", exc_info=True)
         send_and_track(cid, "⚠️ Error", back_button())
 
-# ================= TEXT HANDLER =================
+# ================= TEXT INPUT HANDLER =================
 @bot.message_handler(func=lambda m: True)
 def text_input(m):
     cid = m.chat.id
     uid = m.from_user.id
-    if not cooldown_ok(uid): return
+    if not cooldown_ok(uid):
+        return
     with wait_lock:
-        if cid not in waiting: return
+        if cid not in waiting:
+            return
         mode = waiting.pop(cid)
     t = m.text.strip()[:MAX_TEXT_LEN]
-    if not t: send_and_track(cid, "❌ Empty", back_button()); return
+    if not t:
+        send_and_track(cid, "❌ Empty", back_button())
+        return
     log_interaction(uid, m.from_user.username, m.from_user.first_name, f"text:{mode}", t)
+
     try:
         if mode == "price":
-            p,ch = Binance.price(t.upper())
-            if p is None: send_and_track(cid, f"❌ {escape_md(t)} not found", price_menu()[1])
-            else: send_and_track(cid, f"*{escape_md(t)}*\n{fmt_price(p)}\n{'🟢▲' if ch>=0 else '🔴▼'} {abs(ch):.2f}%", price_menu()[1])
+            p, ch = Binance.price(t.upper())
+            if p is None:
+                send_and_track(cid, f"❌ {escape_md(t)} not found", price_menu()[1])
+            else:
+                arrow = "🟢▲" if ch >= 0 else "🔴▼"
+                send_and_track(cid, f"*{escape_md(t)}*\n{fmt_price(p)}\n{arrow} {abs(ch):.2f}%", price_menu()[1])
         elif mode == "info":
             info = CoinGecko.info(t.upper())
-            if not info: send_and_track(cid, f"❌ {escape_md(t)} not found", info_menu()[1])
-            else: send_and_track(cid, f"🔎 {info['name']} ({info['symbol']})\n{separator()}\nRank: {info['rank']}\nPrice: {fmt_price(info['price'])}\nATH: {fmt_price(info['ath'])} ({info['ath_date']})\nATL: {fmt_price(info['atl'])} ({info['atl_date']})\nMarket Cap: ${info['market_cap']:,.0f}\nVolume: ${info['volume']:,.0f}", info_menu()[1])
+            if not info:
+                send_and_track(cid, f"❌ {escape_md(t)} not found", info_menu()[1])
+            else:
+                text = (f"🔎 {info['name']} ({info['symbol']})\n{separator()}\n"
+                        f"Rank: #{info['rank']}\nPrice: {fmt_price(info['price'])}\n"
+                        f"ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+                        f"ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+                        f"Market Cap: ${info['market_cap']:,.0f}\nVolume: ${info['volume']:,.0f}")
+                send_and_track(cid, text, info_menu()[1])
         elif mode == "multi":
             prices = CoinGecko.multi_price(t.upper())
-            if not prices: send_and_track(cid, f"❌ {escape_md(t)} not found", multi_menu()[1])
+            if not prices:
+                send_and_track(cid, f"❌ {escape_md(t)} not found", multi_menu()[1])
             else:
                 flags = {"usd":"🇺🇸","eur":"🇪🇺","gbp":"🇬🇧","jpy":"🇯🇵","cny":"🇨🇳","aed":"🇦🇪","try":"🇹🇷"}
                 out = f"💱 {escape_md(t)}\n{separator()}\n"
-                for cur,flag in flags.items():
+                for cur, flag in flags.items():
                     p = prices.get(cur)
-                    if p: out += f"{flag} {fmt_price(p)}\n"
+                    if p:
+                        out += f"{flag} {fmt_price(p)}\n"
                 send_and_track(cid, out, multi_menu()[1])
         elif mode == "scan":
-            result, err = GoPlus.scan(t)
+            result, err = ContractScanner.scan(t)
             if err:
                 send_and_track(cid, f"❌ {err}", back_button())
             else:
-                def f(v): return "⚠️ Yes" if v=="1" else "✅ No" if v=="0" else "❓ Unknown"
-                out = f"🛡 *CA Scan*\n{separator()}\n"
-                out += f"🍯 Honeypot: {f(result.get('is_honeypot','?'))}\n"
-                out += f"🖨 Mintable: {f(result.get('is_mintable','?'))}\n"
-                out += f"🔁 Proxy: {f(result.get('is_proxy','?'))}\n"
-                out += f"📂 Open Source: {f(result.get('is_open_source','?'))}\n"
-                out += f"💸 Buy Tax: {result.get('buy_tax','?')}%\n"
-                out += f"💸 Sell Tax: {result.get('sell_tax','?')}%\n"
-                out += f"👥 Holders: {result.get('holder_count','?')}"
+                def flag(v):
+                    if v == "1": return "⚠️ Yes"
+                    if v == "0": return "✅ No"
+                    return "❓ Unknown"
+                out = (f"🛡 *CA Scan*\n{separator()}\n"
+                       f"🍯 Honeypot: {flag(result.get('is_honeypot','?'))}\n"
+                       f"🖨 Mintable: {flag(result.get('is_mintable','?'))}\n"
+                       f"🔁 Proxy: {flag(result.get('is_proxy','?'))}\n"
+                       f"📂 Open Source: {flag(result.get('is_open_source','?'))}\n"
+                       f"💸 Buy Tax: {result.get('buy_tax','?')}%\n"
+                       f"💸 Sell Tax: {result.get('sell_tax','?')}%\n"
+                       f"👥 Holders: {result.get('holder_count','?')}")
                 send_and_track(cid, out, back_button())
         elif mode == "alert":
             parts = t.split()
-            if len(parts)!=3 or parts[1] not in ('>','<'): send_and_track(cid, "❌ Format: BTC > 70000", alerts_menu()[1]); return
-            sym, dir_op, target_str = parts[0].upper(), parts[1], parts[2]
-            try: target = float(target_str)
-            except: send_and_track(cid, "❌ Invalid price", alerts_menu()[1]); return
-            p,_ = Binance.price(sym)
-            if p is None: send_and_track(cid, f"❌ {escape_md(sym)} not found", alerts_menu()[1]); return
-            if get_alert_count(cid) >= MAX_ALERTS_PER_USER: send_and_track(cid, f"❌ Max {MAX_ALERTS_PER_USER} alerts", alerts_menu()[1]); return
-            aid = add_alert(cid, sym, target, dir_op)
+            if len(parts) != 3 or parts[1] not in ('>', '<'):
+                send_and_track(cid, "❌ Format: BTC > 70000", alerts_menu()[1])
+                return
+            sym, direction, target_str = parts[0].upper(), parts[1], parts[2]
+            try:
+                target = float(target_str)
+            except:
+                send_and_track(cid, "❌ Invalid price", alerts_menu()[1])
+                return
+            p, _ = Binance.price(sym)
+            if p is None:
+                send_and_track(cid, f"❌ {escape_md(sym)} not found", alerts_menu()[1])
+                return
+            if get_alert_count(cid) >= MAX_ALERTS_PER_USER:
+                send_and_track(cid, f"❌ Max {MAX_ALERTS_PER_USER} alerts", alerts_menu()[1])
+                return
+            aid = add_alert(cid, sym, target, direction)
             rebuild_ws()
-            send_and_track(cid, f"✅ Alert #{aid} set!\n{sym} {dir_op} ${target:,.2f}", alerts_menu()[1])
+            send_and_track(cid, f"✅ Alert #{aid} set!\n{sym} {direction} ${target:,.2f}", alerts_menu()[1])
     except Exception as e:
-        log.error(f"Text error: {e}", exc_info=True)
+        log.error(f"Text input error: {e}", exc_info=True)
         send_and_track(cid, "⚠️ Error", main_menu()[1])
 
 # ================= START =================
@@ -704,6 +814,6 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Persona Bot – Alerts | Price | Scanner (Improved)")
+log.info("🚀 Persona Bot – Final Clean Version")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
