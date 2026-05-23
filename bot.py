@@ -26,7 +26,7 @@ COOLDOWN_SECONDS = 2
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
 MAX_TEXT_LEN = 200
-MAX_HISTORY = 3
+MAX_HISTORY = 3                     # keep last 3 bot messages
 
 logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s', level=logging.INFO)
 log = logging.getLogger("PersonaBot")
@@ -118,7 +118,7 @@ retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429,500,502,503,504
 adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
-session.headers.update({"User-Agent": "PersonaBot/7.0"})
+session.headers.update({"User-Agent": "PersonaBot/8.0"})
 
 # ================= SERVICES =================
 class Binance:
@@ -313,7 +313,7 @@ def get_alert_count(chat_id):
     row = db_query("SELECT COUNT(*) FROM alerts WHERE active=1 AND chat_id=?", (chat_id,), fetch_one=True)
     return row[0] if row else 0
 
-# ================= WEBSOCKET =================
+# ================= WEBSOCKET (real‑time prices) =================
 ws_stop = False
 ws_lock = threading.RLock()
 last_symbols = set()
@@ -403,17 +403,24 @@ def fmt_price(p):
 def escape_md(t):
     return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', t)
 
-# ================= MESSAGE EDITING (clean UI) =================
-def edit_or_send(chat_id, text, markup=None, message_id=None):
-    """Edit existing message if message_id given, else send new."""
-    if message_id:
-        try:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
-            return message_id
-        except Exception as e:
-            log.error(f"Edit failed: {e}")
+# ================= MESSAGE QUEUE (keep last 3 bot messages) =================
+msg_queue = {}
+q_lock = threading.RLock()
+
+def send_and_track(chat_id, text, markup=None):
+    """Send a new message, track it, delete oldest if exceeding MAX_HISTORY."""
     sent = bot.send_message(chat_id, text, reply_markup=markup)
-    return sent.message_id
+    with q_lock:
+        if chat_id not in msg_queue:
+            msg_queue[chat_id] = []
+        msg_queue[chat_id].append(sent.message_id)
+        while len(msg_queue[chat_id]) > MAX_HISTORY:
+            old = msg_queue[chat_id].pop(0)
+            try:
+                bot.delete_message(chat_id, old)
+            except:
+                pass
+    return sent
 
 # ================= KEYBOARDS =================
 def main_menu():
@@ -441,7 +448,7 @@ def main_menu():
     return text, kb
 
 def price_menu():
-    text = f"`{sep()}`\n💰 **Price**\n`{sep()}`"
+    text = f"`{sep()}`\n💰 **Price**\n`{sep()}`\nTap a coin or search:"
     kb = InlineKeyboardMarkup()
     coins = ["BTC","ETH","BNB","SOL","XRP","DOGE","ADA","AVAX","LINK","MATIC","UNI","ATOM","NEAR","APT","SUI","LTC","SHIB"]
     row = []
@@ -536,7 +543,7 @@ def cooldown_ok(uid):
 def start(m):
     log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
     text, kb = main_menu()
-    bot.send_message(m.chat.id, text, reply_markup=kb)
+    send_and_track(m.chat.id, text, kb)
 
 @bot.message_handler(commands=["stats"])
 def stats(m):
@@ -545,19 +552,17 @@ def stats(m):
     users = db_query("SELECT COUNT(DISTINCT user_id) FROM analytics", fetch_one=True)[0]
     interactions = db_query("SELECT COUNT(*) FROM analytics", fetch_one=True)[0]
     active = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
-    bot.send_message(m.chat.id, f"📊 Stats\nUsers: {users}\nInteractions: {interactions}\nActive alerts: {active}", reply_markup=back_button())
+    send_and_track(m.chat.id, f"📊 Stats\nUsers: {users}\nInteractions: {interactions}\nActive alerts: {active}", back_button())
 
-# ================= CALLBACKS (with message editing) =================
+# ================= CALLBACKS =================
 waiting = {}
 wait_lock = threading.RLock()
-current_msg = {}  # chat_id -> last message id
 
 @bot.callback_query_handler(func=lambda call: True)
 def cb(call):
     uid = call.from_user.id
     cid = call.message.chat.id
     data = call.data
-    msg_id = call.message.message_id
 
     if not cooldown_ok(uid):
         bot.answer_callback_query(call.id, "Slow down")
@@ -566,32 +571,26 @@ def cb(call):
     log_interaction(uid, call.from_user.username, call.from_user.first_name, f"cb:{data[:30]}")
 
     try:
+        # Navigation – send new message (no editing)
         if data == "back_main":
             with wait_lock:
                 waiting.pop(cid, None)
             text, kb = main_menu()
-            new_id = edit_or_send(cid, text, kb, msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, text, kb)
         elif data == "menu_price":
             text, kb = price_menu()
-            new_id = edit_or_send(cid, text, kb, msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, text, kb)
         elif data == "search_coin":
             with wait_lock:
                 waiting[cid] = "price"
-            text = "🔍 Type coin symbol (e.g., PEPE)"
-            new_id = edit_or_send(cid, text, back_button(), msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, "🔍 Type coin symbol (e.g., PEPE)", back_button())
         elif data == "menu_alerts":
             text, kb = alerts_menu()
-            new_id = edit_or_send(cid, text, kb, msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, text, kb)
         elif data == "custom_alert":
             with wait_lock:
                 waiting[cid] = "alert"
-            text = "✏️ Format: COIN > price\nExample: BTC > 95000"
-            new_id = edit_or_send(cid, text, back_button(), msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, "✏️ Format: COIN > price\nExample: BTC > 95000", back_button())
         elif data.startswith("setalert_"):
             parts = data.split("_")
             if len(parts) != 4:
@@ -600,23 +599,22 @@ def cb(call):
             try:
                 target = float(t)
             except:
-                edit_or_send(cid, "❌ Invalid price", alerts_menu()[1], msg_id)
+                send_and_track(cid, "❌ Invalid price", alerts_menu()[1])
                 return
             p, _ = Binance.price(sym)
             if p is None:
-                edit_or_send(cid, f"❌ {sym} not found", alerts_menu()[1], msg_id)
+                send_and_track(cid, f"❌ {sym} not found", alerts_menu()[1])
                 return
             if get_alert_count(cid) >= MAX_ALERTS_PER_USER:
-                edit_or_send(cid, f"❌ Max {MAX_ALERTS_PER_USER} alerts", alerts_menu()[1], msg_id)
+                send_and_track(cid, f"❌ Max {MAX_ALERTS_PER_USER} alerts", alerts_menu()[1])
                 return
             aid = add_alert(cid, sym, target, direction)
             rebuild_ws()
-            new_id = edit_or_send(cid, f"✅ Alert #{aid} set!\n{sym} {direction} ${target:,.2f}", alerts_menu()[1], msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, f"✅ Alert #{aid} set!\n{sym} {direction} ${target:,.2f}", alerts_menu()[1])
         elif data == "list_alerts":
             active = get_active_alerts(cid)
             if not active:
-                edit_or_send(cid, "📋 No active alerts", alerts_menu()[1], msg_id)
+                send_and_track(cid, "📋 No active alerts", alerts_menu()[1])
                 return
             text = "📋 *Active Alerts*\n" + sep() + "\n"
             kb = InlineKeyboardMarkup()
@@ -625,15 +623,14 @@ def cb(call):
                 text += f"#{a['id']} {a['coin']} {label} ${a['target']:,.2f}\n"
                 kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
             kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-            new_id = edit_or_send(cid, text, kb, msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, text, kb)
         elif data.startswith("cancel_"):
             aid = int(data.split("_")[1])
             deactivate_alert(aid)
             rebuild_ws()
             active = get_active_alerts(cid)
             if not active:
-                new_id = edit_or_send(cid, "📋 No active alerts", back_button(), msg_id)
+                send_and_track(cid, "📋 No active alerts", back_button())
             else:
                 text = "📋 *Active Alerts*\n" + sep() + "\n"
                 kb = InlineKeyboardMarkup()
@@ -642,54 +639,48 @@ def cb(call):
                     text += f"#{a['id']} {a['coin']} {label} ${a['target']:,.2f}\n"
                     kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
                 kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-                new_id = edit_or_send(cid, text, kb, msg_id)
-            current_msg[cid] = new_id
+                send_and_track(cid, text, kb)
         elif data.startswith("price_"):
             sym = data.split("_")[1]
             p, ch = Binance.price(sym)
             if p is None:
-                edit_or_send(cid, f"❌ {sym} not found", price_menu()[1], msg_id)
+                send_and_track(cid, f"❌ {sym} not found", price_menu()[1])
             else:
                 arrow = "🟢▲" if ch >= 0 else "🔴▼"
                 text = f"*{sym}*\n💵 {fmt_price(p)}\n{arrow} {abs(ch):.2f}%"
-                new_id = edit_or_send(cid, text, price_menu()[1], msg_id)
-                current_msg[cid] = new_id
+                send_and_track(cid, text, price_menu()[1])
         elif data == "gainers":
             g, _ = Binance.top_movers()
             if not g:
-                edit_or_send(cid, "❌ No data", back_button(), msg_id)
+                send_and_track(cid, "❌ No data", back_button())
             else:
                 text = "🚀 *Gainers*\n" + sep() + "\n"
                 for d in g:
                     coin = d["symbol"].replace("USDT", "")
                     text += f"🟢 {coin} {fmt_price(float(d['lastPrice']))} ▲ {float(d['priceChangePercent']):.2f}%\n"
-                new_id = edit_or_send(cid, text, back_button(), msg_id)
-                current_msg[cid] = new_id
+                send_and_track(cid, text, back_button())
         elif data == "losers":
             _, l = Binance.top_movers()
             if not l:
-                edit_or_send(cid, "❌ No data", back_button(), msg_id)
+                send_and_track(cid, "❌ No data", back_button())
             else:
                 text = "📉 *Losers*\n" + sep() + "\n"
                 for d in l:
                     coin = d["symbol"].replace("USDT", "")
                     text += f"🔴 {coin} {fmt_price(float(d['lastPrice']))} ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
-                new_id = edit_or_send(cid, text, back_button(), msg_id)
-                current_msg[cid] = new_id
+                send_and_track(cid, text, back_button())
         elif data == "menu_info":
             text, kb = info_menu()
-            new_id = edit_or_send(cid, text, kb, msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, text, kb)
         elif data == "search_info":
             with wait_lock:
                 waiting[cid] = "info"
-            new_id = edit_or_send(cid, "🔍 Enter coin symbol", back_button(), msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, "🔍 Enter coin symbol", back_button())
         elif data.startswith("info_"):
             sym = data.split("_")[1]
             info = CoinGecko.info(sym)
             if not info:
-                edit_or_send(cid, f"❌ No info for {sym}", info_menu()[1], msg_id)
+                send_and_track(cid, f"❌ No info for {sym}", info_menu()[1])
             else:
                 text = (f"🔎 *{info['name']} ({info['symbol']})*\n{sep()}\n"
                         f"Rank: #{info['rank']}\n"
@@ -698,22 +689,19 @@ def cb(call):
                         f"ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
                         f"Market Cap: ${info['market_cap']:,.0f}\n"
                         f"Volume: ${info['volume']:,.0f}")
-                new_id = edit_or_send(cid, text, info_menu()[1], msg_id)
-                current_msg[cid] = new_id
+                send_and_track(cid, text, info_menu()[1])
         elif data == "menu_multi":
             text, kb = multi_menu()
-            new_id = edit_or_send(cid, text, kb, msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, text, kb)
         elif data == "search_multi":
             with wait_lock:
                 waiting[cid] = "multi"
-            new_id = edit_or_send(cid, "🔍 Enter coin symbol", back_button(), msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, "🔍 Enter coin symbol", back_button())
         elif data.startswith("multi_"):
             sym = data.split("_")[1]
             prices = CoinGecko.multi_price(sym)
             if not prices:
-                edit_or_send(cid, f"❌ No data for {sym}", multi_menu()[1], msg_id)
+                send_and_track(cid, f"❌ No data for {sym}", multi_menu()[1])
             else:
                 flags = {"usd":"🇺🇸","eur":"🇪🇺","gbp":"🇬🇧","jpy":"🇯🇵","cny":"🇨🇳","aed":"🇦🇪","try":"🇹🇷"}
                 text = f"💱 {sym}\n{sep()}\n"
@@ -721,13 +709,11 @@ def cb(call):
                     p = prices.get(cur)
                     if p:
                         text += f"{flag} {fmt_price(p)}\n"
-                new_id = edit_or_send(cid, text, multi_menu()[1], msg_id)
-                current_msg[cid] = new_id
+                send_and_track(cid, text, multi_menu()[1])
         elif data == "menu_scan":
             with wait_lock:
                 waiting[cid] = "scan"
-            new_id = edit_or_send(cid, "🛡 Paste contract address (ETH/BSC/Solana)", back_button(), msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, "🛡 Paste contract address (ETH/BSC/Solana)", back_button())
         elif data == "profile":
             p = get_profile(uid)
             text = (f"👤 Profile\n{sep()}\n"
@@ -735,15 +721,14 @@ def cb(call):
                     f"Interactions: {p['total_interactions']}\n"
                     f"Alerts set: {p['alerts_set']}\n"
                     f"Alerts triggered: {p['alerts_triggered']}")
-            new_id = edit_or_send(cid, text, back_button(), msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, text, back_button())
         else:
             pass
     except Exception as e:
         log.error(f"Callback error: {e}", exc_info=True)
-        edit_or_send(cid, "⚠️ Error", back_button(), msg_id)
+        send_and_track(cid, "⚠️ Error", back_button())
 
-# ================= TEXT HANDLER =================
+# ================= TEXT HANDLER (with user message deletion) =================
 @bot.message_handler(func=lambda m: True)
 def text_input(m):
     cid = m.chat.id
@@ -759,31 +744,27 @@ def text_input(m):
     if not t:
         return
 
-    # [NEW] Try to delete the user's message (works only in groups where bot is admin)
+    # Try to delete the user's message (works only in groups where bot is admin)
     try:
         bot.delete_message(cid, m.message_id)
     except Exception:
-        pass  # Fails silently in private chats
+        pass
 
     log_interaction(uid, m.from_user.username, m.from_user.first_name, f"text:{mode}", t)
-
-    # Get current message ID to edit (the menu message)
-    msg_id = current_msg.get(cid)
 
     try:
         if mode == "price":
             p, ch = Binance.price(t.upper())
             if p is None:
-                edit_or_send(cid, f"❌ {escape_md(t)} not found", price_menu()[1], msg_id)
+                send_and_track(cid, f"❌ {escape_md(t)} not found", price_menu()[1])
             else:
                 arrow = "🟢▲" if ch >= 0 else "🔴▼"
                 text = f"*{escape_md(t)}*\n💵 {fmt_price(p)}\n{arrow} {abs(ch):.2f}%"
-                new_id = edit_or_send(cid, text, price_menu()[1], msg_id)
-                current_msg[cid] = new_id
+                send_and_track(cid, text, price_menu()[1])
         elif mode == "info":
             info = CoinGecko.info(t.upper())
             if not info:
-                edit_or_send(cid, f"❌ {escape_md(t)} not found", info_menu()[1], msg_id)
+                send_and_track(cid, f"❌ {escape_md(t)} not found", info_menu()[1])
             else:
                 text = (f"🔎 *{info['name']} ({info['symbol']})*\n{sep()}\n"
                         f"Rank: #{info['rank']}\n"
@@ -792,12 +773,11 @@ def text_input(m):
                         f"ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
                         f"Market Cap: ${info['market_cap']:,.0f}\n"
                         f"Volume: ${info['volume']:,.0f}")
-                new_id = edit_or_send(cid, text, info_menu()[1], msg_id)
-                current_msg[cid] = new_id
+                send_and_track(cid, text, info_menu()[1])
         elif mode == "multi":
             prices = CoinGecko.multi_price(t.upper())
             if not prices:
-                edit_or_send(cid, f"❌ {escape_md(t)} not found", multi_menu()[1], msg_id)
+                send_and_track(cid, f"❌ {escape_md(t)} not found", multi_menu()[1])
             else:
                 flags = {"usd":"🇺🇸","eur":"🇪🇺","gbp":"🇬🇧","jpy":"🇯🇵","cny":"🇨🇳","aed":"🇦🇪","try":"🇹🇷"}
                 text = f"💱 {escape_md(t)}\n{sep()}\n"
@@ -805,12 +785,11 @@ def text_input(m):
                     p = prices.get(cur)
                     if p:
                         text += f"{flag} {fmt_price(p)}\n"
-                new_id = edit_or_send(cid, text, multi_menu()[1], msg_id)
-                current_msg[cid] = new_id
+                send_and_track(cid, text, multi_menu()[1])
         elif mode == "scan":
             result, err = ContractScanner.scan(t)
             if err:
-                edit_or_send(cid, f"❌ {err}", back_button(), msg_id)
+                send_and_track(cid, f"❌ {err}", back_button())
             else:
                 def flag(v):
                     if v == "1": return "⚠️ Yes"
@@ -824,33 +803,31 @@ def text_input(m):
                         f"💸 Buy Tax: {result.get('buy_tax','?')}%\n"
                         f"💸 Sell Tax: {result.get('sell_tax','?')}%\n"
                         f"👥 Holders: {result.get('holder_count','?')}")
-                new_id = edit_or_send(cid, text, back_button(), msg_id)
-                current_msg[cid] = new_id
+                send_and_track(cid, text, back_button())
         elif mode == "alert":
             parts = t.split()
             if len(parts) != 3 or parts[1] not in ('>', '<'):
-                edit_or_send(cid, "❌ Format: BTC > 70000", alerts_menu()[1], msg_id)
+                send_and_track(cid, "❌ Format: BTC > 70000", alerts_menu()[1])
                 return
             sym, direction, target_str = parts[0].upper(), parts[1], parts[2]
             try:
                 target = float(target_str)
             except:
-                edit_or_send(cid, "❌ Invalid price", alerts_menu()[1], msg_id)
+                send_and_track(cid, "❌ Invalid price", alerts_menu()[1])
                 return
             p, _ = Binance.price(sym)
             if p is None:
-                edit_or_send(cid, f"❌ {escape_md(sym)} not found", alerts_menu()[1], msg_id)
+                send_and_track(cid, f"❌ {escape_md(sym)} not found", alerts_menu()[1])
                 return
             if get_alert_count(cid) >= MAX_ALERTS_PER_USER:
-                edit_or_send(cid, f"❌ Max {MAX_ALERTS_PER_USER} alerts", alerts_menu()[1], msg_id)
+                send_and_track(cid, f"❌ Max {MAX_ALERTS_PER_USER} alerts", alerts_menu()[1])
                 return
             aid = add_alert(cid, sym, target, direction)
             rebuild_ws()
-            new_id = edit_or_send(cid, f"✅ Alert #{aid} set!\n{sym} {direction} ${target:,.2f}", alerts_menu()[1], msg_id)
-            current_msg[cid] = new_id
+            send_and_track(cid, f"✅ Alert #{aid} set!\n{sym} {direction} ${target:,.2f}", alerts_menu()[1])
     except Exception as e:
         log.error(f"Text error: {e}", exc_info=True)
-        edit_or_send(cid, "⚠️ Error", back_button(), msg_id)
+        send_and_track(cid, "⚠️ Error", back_button())
 
 # ================= START =================
 def stop(sig, frame):
@@ -862,6 +839,6 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Persona Bot – Clean UI, Fast, Reliable (with user message deletion attempt)")
+log.info("🚀 Persona Bot – No editing, keeps last 3 bot messages, deletes user message (group admin)")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
