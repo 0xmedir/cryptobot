@@ -148,11 +148,10 @@ class Binance:
             return [], []
 
 class CoinGecko:
+    # Only used for internal mapping; search handles everything else
     COIN_MAP = {
         "BTC":"bitcoin","ETH":"ethereum","BNB":"binancecoin","SOL":"solana","XRP":"ripple",
-        "DOGE":"dogecoin","ADA":"cardano","AVAX":"avalanche-2","LINK":"chainlink","MATIC":"matic-network",
-        "UNI":"uniswap","ATOM":"cosmos","NEAR":"near","APT":"aptos","SUI":"sui","LTC":"litecoin",
-        "SHIB":"shiba-inu","PEPE":"pepe","WIF":"dogwifcoin","SEI":"sei-network","TRX":"tron","DOT":"polkadot"
+        "DOGE":"dogecoin","ADA":"cardano","AVAX":"avalanche-2","LINK":"chainlink","MATIC":"matic-network"
     }
     @staticmethod
     def info(symbol):
@@ -160,8 +159,10 @@ class CoinGecko:
         cached = coin_cache.get(sym_up)
         if cached:
             return cached
+        # Try direct map first
         coin_id = CoinGecko.COIN_MAP.get(sym_up)
         if not coin_id:
+            # Search
             try:
                 r = session.get(f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}", timeout=10)
                 if r.status_code != 200:
@@ -429,7 +430,7 @@ def send_and_track(chat_id, text, markup=None):
                 pass
     return sent
 
-# ================= KEYBOARDS (clean UI) =================
+# ================= KEYBOARDS (10 coins only) =================
 def main_menu():
     text = "🤖 **PERSONA**\n\nYour crypto terminal\n\n"
     kb = InlineKeyboardMarkup()
@@ -457,7 +458,7 @@ def main_menu():
 def price_menu():
     text = "💰 **Price**\n\nTap a coin or search:"
     kb = InlineKeyboardMarkup()
-    coins = ["BTC","ETH","BNB","SOL","XRP","DOGE","ADA","AVAX","LINK","MATIC","UNI","ATOM","NEAR","APT","SUI","LTC","SHIB"]
+    coins = ["BTC","ETH","BNB","SOL","XRP","DOGE","ADA","AVAX","LINK","MATIC"]
     row = []
     for i, c in enumerate(coins, 1):
         row.append(InlineKeyboardButton(c, callback_data=f"price_{c}"))
@@ -491,40 +492,33 @@ def alerts_menu():
     return text, kb
 
 def info_menu():
-    text = "🔎 **Coin Info**\n\nSelect a coin:"
+    text = "🔎 **Coin Info**\n\nSelect a coin or search:"
     kb = InlineKeyboardMarkup()
-    kb.row(
-        InlineKeyboardButton("BTC", callback_data="info_BTC"),
-        InlineKeyboardButton("ETH", callback_data="info_ETH"),
-        InlineKeyboardButton("BNB", callback_data="info_BNB")
-    )
-    kb.row(
-        InlineKeyboardButton("SOL", callback_data="info_SOL"),
-        InlineKeyboardButton("XRP", callback_data="info_XRP"),
-        InlineKeyboardButton("ADA", callback_data="info_ADA")
-    )
-    kb.row(
-        InlineKeyboardButton("DOGE", callback_data="info_DOGE"),
-        InlineKeyboardButton("AVAX", callback_data="info_AVAX"),
-        InlineKeyboardButton("LINK", callback_data="info_LINK")
-    )
+    coins = ["BTC","ETH","BNB","SOL","XRP","DOGE","ADA","AVAX","LINK","MATIC"]
+    row = []
+    for i, c in enumerate(coins, 1):
+        row.append(InlineKeyboardButton(c, callback_data=f"info_{c}"))
+        if i % 3 == 0:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
     kb.row(InlineKeyboardButton("🔍 Search", callback_data="search_info"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def multi_menu():
-    text = "💱 **Multi‑Currency**\n\nSelect a coin:"
+    text = "💱 **Multi‑Currency**\n\nSelect a coin or search:"
     kb = InlineKeyboardMarkup()
-    kb.row(
-        InlineKeyboardButton("BTC", callback_data="multi_BTC"),
-        InlineKeyboardButton("ETH", callback_data="multi_ETH"),
-        InlineKeyboardButton("BNB", callback_data="multi_BNB")
-    )
-    kb.row(
-        InlineKeyboardButton("SOL", callback_data="multi_SOL"),
-        InlineKeyboardButton("XRP", callback_data="multi_XRP"),
-        InlineKeyboardButton("ADA", callback_data="multi_ADA")
-    )
+    coins = ["BTC","ETH","BNB","SOL","XRP","ADA","MATIC"]
+    row = []
+    for i, c in enumerate(coins, 1):
+        row.append(InlineKeyboardButton(c, callback_data=f"multi_{c}"))
+        if i % 3 == 0:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
     kb.row(InlineKeyboardButton("🔍 Search", callback_data="search_multi"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
@@ -565,25 +559,28 @@ def stats_cmd(m):
 def users_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    rows = db_query("SELECT DISTINCT user_id FROM analytics ORDER BY user_id", fetch_all=True)
+    rows = db_query("SELECT DISTINCT user_id, username, first_name FROM analytics ORDER BY user_id", fetch_all=True)
     if not rows:
         send_and_track(m.chat.id, "No users yet.", back_button())
         return
-    user_list = "\n".join([str(r[0]) for r in rows[:50]])
+    user_list = []
+    for uid, uname, fname in rows[:50]:
+        name_part = fname if fname else "?"
+        user_part = f"@{uname}" if uname and uname != "?" else "no username"
+        user_list.append(f"`{uid}` – {name_part} ({user_part})")
     if len(rows) > 50:
-        user_list += f"\n... and {len(rows)-50} more"
-    send_and_track(m.chat.id, f"👥 **Users** (total {len(rows)})\n\n{user_list}", back_button())
+        user_list.append(f"... and {len(rows)-50} more")
+    text = f"👥 **Users** (total {len(rows)})\n\n" + "\n".join(user_list)
+    send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["broadcast"])
 def broadcast_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    # Format: /broadcast Your message here
     msg_text = m.text.replace("/broadcast", "", 1).strip()
     if not msg_text:
         send_and_track(m.chat.id, "Usage: `/broadcast Your message`", back_button())
         return
-    # Get all unique user IDs
     rows = db_query("SELECT DISTINCT user_id FROM analytics", fetch_all=True)
     if not rows:
         send_and_track(m.chat.id, "No users to broadcast.", back_button())
@@ -594,7 +591,7 @@ def broadcast_cmd(m):
         try:
             bot.send_message(uid, f"📢 **Broadcast**\n\n{msg_text}")
             sent_count += 1
-            time.sleep(0.05)  # avoid flooding
+            time.sleep(0.05)
         except Exception as e:
             log.error(f"Broadcast failed to {uid}: {e}")
             fail_count += 1
@@ -643,7 +640,7 @@ def cb(call):
         elif data == "search_coin":
             with wait_lock:
                 waiting[cid] = "price"
-            send_and_track(cid, "🔍 Type coin symbol (e.g., PEPE)", back_button())
+            send_and_track(cid, "🔍 Type coin symbol (e.g., PEPE, TAO)", back_button())
         elif data == "menu_alerts":
             text, kb = alerts_menu()
             send_and_track(cid, text, kb)
@@ -735,7 +732,7 @@ def cb(call):
         elif data == "search_info":
             with wait_lock:
                 waiting[cid] = "info"
-            send_and_track(cid, "🔍 Enter coin symbol", back_button())
+            send_and_track(cid, "🔍 Enter coin symbol (e.g., BTC, PEPE)", back_button())
         elif data.startswith("info_"):
             sym = data.split("_")[1]
             info = CoinGecko.info(sym)
@@ -757,7 +754,7 @@ def cb(call):
         elif data == "search_multi":
             with wait_lock:
                 waiting[cid] = "multi"
-            send_and_track(cid, "🔍 Enter coin symbol", back_button())
+            send_and_track(cid, "🔍 Enter coin symbol (e.g., BTC, PEPE)", back_button())
         elif data.startswith("multi_"):
             sym = data.split("_")[1]
             prices = CoinGecko.multi_price(sym)
@@ -919,6 +916,6 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Persona Bot – Full Admin Features (stats, users, broadcast, clear_alerts)")
+log.info("🚀 Persona Bot – 10 coins grid, search any coin, admin user details")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
