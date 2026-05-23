@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final (Auto‑migration, no streak, clean profile)
+Persona Bot – Final (Short descriptions, admin sees usernames)
 """
 
 import telebot
@@ -43,7 +43,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
 # =========================
-# DATABASE (auto‑migration)
+# DATABASE (auto‑migration to add username/name)
 # =========================
 db_path = "data/persona.db"
 db_lock = threading.RLock()
@@ -75,23 +75,23 @@ def db_query(query, params=(), fetch_one=False, fetch_all=False, retries=3):
     return None
 
 def init_db():
-    # First, check if we need to migrate from old streak schema
+    # Migrate old schema (drop streak, add username/first_name)
     try:
-        # Check if profiles table exists and has streak column
         cur = conn.cursor()
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='profiles'")
         if cur.fetchone():
-            # Get column names
             cur.execute("PRAGMA table_info(profiles)")
             columns = [col[1] for col in cur.fetchall()]
             if 'streak' in columns:
-                log.info("Old profiles schema detected (streak column). Dropping and recreating.")
-                # Drop and recreate cleanly
+                log.info("Old profiles schema detected. Dropping and recreating.")
                 conn.execute("DROP TABLE profiles")
+            elif 'username' not in columns:
+                log.info("Adding username and first_name columns to profiles.")
+                conn.execute("ALTER TABLE profiles ADD COLUMN username TEXT")
+                conn.execute("ALTER TABLE profiles ADD COLUMN first_name TEXT")
     except Exception as e:
         log.error(f"Migration check error: {e}")
 
-    # Create fresh tables (with no streak)
     db_query("""
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,7 +110,9 @@ def init_db():
             join_date INTEGER,
             total_interactions INTEGER DEFAULT 0,
             alerts_set INTEGER DEFAULT 0,
-            alerts_triggered INTEGER DEFAULT 0
+            alerts_triggered INTEGER DEFAULT 0,
+            username TEXT,
+            first_name TEXT
         )
     """)
     db_query("""
@@ -212,7 +214,7 @@ def safe_first_200(text):
     return (text or "")[:200]
 
 # =========================
-# PROFILES (no streak)
+# PROFILES
 # =========================
 def get_profile(user_id):
     row = db_query("SELECT * FROM profiles WHERE user_id=?", (user_id,), fetch_one=True)
@@ -225,14 +227,17 @@ def get_profile(user_id):
             "total_interactions": 0,
             "alerts_set": 0,
             "alerts_triggered": 0,
+            "username": None,
+            "first_name": None,
         }
-    # row format: (user_id, join_date, total_interactions, alerts_set, alerts_triggered)
     return {
         "user_id": row[0],
         "join_date": row[1],
         "total_interactions": row[2],
         "alerts_set": row[3],
         "alerts_triggered": row[4],
+        "username": row[5],
+        "first_name": row[6],
     }
 
 def update_profile(user_id, **kwargs):
@@ -240,11 +245,14 @@ def update_profile(user_id, **kwargs):
         db_query(f"UPDATE profiles SET {key}=? WHERE user_id=?", (value, user_id))
 
 def log_interaction(uid, uname, fname, cmd, det=""):
+    p = get_profile(uid)
+    if p["username"] != uname or p["first_name"] != fname:
+        update_profile(uid, username=uname, first_name=fname)
+
     db_query(
         "INSERT INTO analytics(timestamp,user_id,username,first_name,command,details) VALUES(?,?,?,?,?,?)",
         (int(time.time()), uid, uname or "?", fname or "?", cmd, safe_first_200(det)),
     )
-    p = get_profile(uid)
     update_profile(uid, total_interactions=p["total_interactions"] + 1)
 
 def is_admin(uid):
@@ -489,7 +497,7 @@ def get_alert_count(chat_id):
     return row[0] if row else 0
 
 # =========================
-# WEBSOCKET PRICE FEED (robust)
+# WEBSOCKET PRICE FEED
 # =========================
 ws_restart = threading.Event()
 ws_restart.set()
@@ -617,11 +625,11 @@ def send_and_track(chat_id, text, markup=None):
     return sent
 
 # =========================
-# UI / MENUS
+# UI / MENUS (shorter descriptions)
 # =========================
 def back_button():
     kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
 def coin_grid(prefix, coins):
@@ -638,9 +646,8 @@ def coin_grid(prefix, coins):
 
 def main_menu():
     text = (
-        "⚡ <b>PERSONA</b>\n\n"
-        "Your crypto cockpit.\n"
-        "Fast taps, live prices, alert traps, and token intel."
+        "🤖  <b>PERSONA</b>\n\n"
+        "Fast crypto tools: prices, alerts, intel."
     )
     kb = InlineKeyboardMarkup()
     kb.row(
@@ -672,7 +679,7 @@ def price_menu():
     )
     kb = coin_grid("price", ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "MATIC"])
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_price"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def info_menu():
@@ -682,7 +689,7 @@ def info_menu():
     )
     kb = coin_grid("info", ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "MATIC"])
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_info"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def multi_menu():
@@ -692,7 +699,7 @@ def multi_menu():
     )
     kb = coin_grid("multi", ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "MATIC"])
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def alerts_menu():
@@ -715,14 +722,13 @@ def alerts_menu():
     )
     kb.row(InlineKeyboardButton("✏️ Custom alert", callback_data="custom_alert"))
     kb.row(InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def scan_menu():
     text = (
         "🛡 <b>Contract Scanner</b>\n\n"
-        "Send an EVM or Solana contract address.\n"
-        "Best used for token safety checks."
+        "Paste contract address (ETH/BSC/Solana)"
     )
     return text, back_button()
 
@@ -765,7 +771,7 @@ def users_cmd(m):
     if not is_admin(m.from_user.id):
         return
     rows = db_query(
-        "SELECT user_id, total_interactions, alerts_set, alerts_triggered FROM profiles ORDER BY total_interactions DESC LIMIT 50",
+        "SELECT user_id, username, first_name, total_interactions, alerts_set, alerts_triggered FROM profiles ORDER BY total_interactions DESC LIMIT 50",
         fetch_all=True,
     )
     if not rows:
@@ -773,12 +779,11 @@ def users_cmd(m):
         return
 
     lines = []
-    for uid, interactions, alerts_set, alerts_triggered in rows:
+    for uid, username, first_name, interactions, alerts_set, alerts_triggered in rows:
+        display_name = f"{first_name or '?'} (@{username or 'no username'})"
         lines.append(
-            f"<code>{uid}</code> — "
-            f"💬 {interactions} | "
-            f"🔔 {alerts_set} | "
-            f"⚡ {alerts_triggered}"
+            f"<code>{uid}</code> — {display_name}\n"
+            f"   💬 {interactions} | 🔔 {alerts_set} | ⚡ {alerts_triggered}"
         )
 
     total = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
@@ -849,7 +854,7 @@ def render_alert_list(chat_id):
         arrow = "▲" if a["direction"] == ">" else "▼"
         text += f"#{a['id']} <b>{h(a['coin'])}</b> {arrow} <b>${a['target']:,.2f}</b>\n"
         kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -1201,6 +1206,6 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started (no streak, auto‑migrated schema, clean profile)")
+log.info("🚀 Persona Bot started (shorter descriptions, admin sees usernames)")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
