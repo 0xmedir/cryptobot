@@ -20,8 +20,7 @@ if not BOT_TOKEN:
     print("❌ BOT_TOKEN environment variable not set. Exiting.")
     sys.exit(1)
 
-# Admin user IDs (your Telegram user ID)
-ADMIN_IDS = [7458428092]  # Your ID
+ADMIN_IDS = [7458428092]
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 ALERTS_FILE = "alerts.json"
@@ -31,15 +30,22 @@ COOLDOWN_SECONDS = 2
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
 ANALYTICS_FILE = "analytics.csv"
+COIN_INFO_CACHE_TTL = 3600
+MULTI_PRICE_CACHE_TTL = 60
 
 PRICE_CACHE = {}
+MULTI_PRICE_CACHE = {}
 waiting_for = {}
 user_msg_queue = {}
 cooldowns = {}
 ws_restart_required = False
 lock = threading.Lock()
+alert_counter_lock = threading.Lock()
 active_ws = None
 shutdown_flag = False
+
+# ================= STARTUP =================
+os.makedirs("data", exist_ok=True)
 
 # ================= USER TRACKING =================
 def init_analytics():
@@ -59,7 +65,7 @@ def log_interaction(user_id, username, first_name, command, details=""):
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-# ================= ATOMIC SAVE & LOGGING =================
+# ================= LOGGING =================
 def log(msg, level="INFO"):
     print(f"[{level}] {time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}")
 
@@ -140,7 +146,7 @@ def retry_with_backoff(max_retries=3, base_delay=1):
                 try:
                     return f(*a, **k)
                 except Exception as e:
-                    if attempt == max_retries-1:
+                    if attempt == max_retries - 1:
                         raise
                     delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
                     log(f"Retry {f.__name__} attempt {attempt+1} in {delay:.2f}s: {e}", "WARNING")
@@ -149,7 +155,7 @@ def retry_with_backoff(max_retries=3, base_delay=1):
         return wrapper
     return decorator
 
-# ================= GLOBAL REQUESTS SESSION =================
+# ================= SESSION =================
 session = requests.Session()
 session.headers.update({"User-Agent": "PersonaBot/2.0 (crypto assistant)"})
 
@@ -158,17 +164,11 @@ session.headers.update({"User-Agent": "PersonaBot/2.0 (crypto assistant)"})
 def get_price(symbol):
     pair = symbol.upper() + "USDT"
     try:
-        r = session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={pair}", timeout=10)
+        r = session.get(f"https://api.binance.com/api/v3/ticker/24hr?symbol={pair}", timeout=10)
         data = r.json()
-        if "price" not in data:
+        if "lastPrice" not in data:
             return None, None
-        price = float(data["price"])
-        r2 = session.get(f"https://api.binance.com/api/v3/ticker/24hr?symbol={pair}", timeout=10)
-        data2 = r2.json()
-        if "priceChangePercent" not in data2:
-            return price, 0.0
-        change = float(data2["priceChangePercent"])
-        return price, change
+        return float(data["lastPrice"]), float(data.get("priceChangePercent", 0))
     except Exception as e:
         log(f"get_price error for {symbol}: {e}", "ERROR")
         return None, None
@@ -178,11 +178,11 @@ def get_top_movers():
     try:
         r = session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
         data = r.json()
-        stable = {"USDT","BUSD","USDC","DAI","FDUSD"}
+        stable = {"USDT", "BUSD", "USDC", "DAI", "FDUSD"}
         filtered = [
             d for d in data
             if d["symbol"].endswith("USDT")
-            and d["symbol"].replace("USDT","") not in stable
+            and d["symbol"].replace("USDT", "") not in stable
             and float(d.get("quoteVolume", 0)) > 1_000_000
             and "priceChangePercent" in d
         ]
@@ -192,15 +192,15 @@ def get_top_movers():
         log(f"get_top_movers error: {e}", "ERROR")
         return None, None
 
+coin_info_cache = {}
+
 @retry_with_backoff(max_retries=3, base_delay=2)
 def get_coin_info(symbol):
     symbol_up = symbol.upper()
-    if not hasattr(get_coin_info, "cache"):
-        get_coin_info.cache = {}
     now = time.time()
-    if symbol_up in get_coin_info.cache:
-        cached = get_coin_info.cache[symbol_up]
-        if now - cached["timestamp"] < 3600:
+    if symbol_up in coin_info_cache:
+        cached = coin_info_cache[symbol_up]
+        if now - cached["timestamp"] < COIN_INFO_CACHE_TTL:
             return cached["data"]
 
     cg_id_map = {
@@ -211,7 +211,8 @@ def get_coin_info(symbol):
         "NEAR": "near", "APT": "aptos", "SUI": "sui", "LTC": "litecoin",
         "SHIB": "shiba-inu", "TON": "the-open-network", "ARB": "arbitrum",
         "OP": "optimism", "INJ": "injective-protocol", "TIA": "celestia",
-        "PEPE": "pepe", "WIF": "dogwifcoin", "SEI": "sei-network"
+        "PEPE": "pepe", "WIF": "dogwifcoin", "SEI": "sei-network",
+        "TRX": "tron", "DOT": "polkadot",
     }
     coin_id = cg_id_map.get(symbol_up)
     if not coin_id:
@@ -219,34 +220,25 @@ def get_coin_info(symbol):
             r = session.get(f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}", timeout=10)
             if r.status_code == 200:
                 coins = r.json().get("coins", [])
-                if coins:
-                    coin_id = coins[0]["id"]
-                else:
-                    return None
-            else:
+                coin_id = coins[0]["id"] if coins else None
+            if not coin_id:
                 return None
         except Exception as e:
             log(f"Coin search error: {e}", "ERROR")
             return None
 
     try:
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-        params = {
-            "localization": "false",
-            "tickers": "false",
-            "community_data": "false",
-            "developer_data": "false",
-            "sparkline": "false"
-        }
-        r = session.get(url, params=params, timeout=15)
+        r = session.get(
+            f"https://api.coingecko.com/api/v3/coins/{coin_id}",
+            params={"localization": "false", "tickers": "false", "community_data": "false", "developer_data": "false", "sparkline": "false"},
+            timeout=15
+        )
         if r.status_code == 429:
-            log("CoinGecko rate limit, waiting 60s", "WARNING")
-            time.sleep(60)
+            log("CoinGecko rate limit", "WARNING")
+            time.sleep(30)
             return None
         if r.status_code != 200:
-            log(f"CoinGecko returned {r.status_code} for {symbol_up}", "WARNING")
             return None
-
         data = r.json()
         md = data["market_data"]
         result = {
@@ -265,7 +257,7 @@ def get_coin_info(symbol):
             "market_cap": md.get("market_cap", {}).get("usd", 0),
             "volume": md.get("total_volume", {}).get("usd", 0),
         }
-        get_coin_info.cache[symbol_up] = {"data": result, "timestamp": now}
+        coin_info_cache[symbol_up] = {"data": result, "timestamp": now}
         return result
     except Exception as e:
         log(f"Coin info error for {symbol_up}: {e}", "ERROR")
@@ -273,6 +265,12 @@ def get_coin_info(symbol):
 
 @retry_with_backoff(max_retries=2)
 def get_multi_price(symbol):
+    symbol_up = symbol.upper()
+    now = time.time()
+    if symbol_up in MULTI_PRICE_CACHE:
+        cached = MULTI_PRICE_CACHE[symbol_up]
+        if now - cached["timestamp"] < MULTI_PRICE_CACHE_TTL:
+            return cached["data"]
     try:
         r = session.get(f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}", timeout=10)
         if r.status_code != 200:
@@ -281,14 +279,16 @@ def get_multi_price(symbol):
         if not coins:
             return None
         coin_id = coins[0]["id"]
-    except:
-        return None
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        params = {"ids": coin_id, "vs_currencies": "usd,eur,gbp,jpy,cny,aed,try", "include_24hr_change": "true"}
-        r = session.get(url, params=params, timeout=10)
-        if r.status_code == 200:
-            return r.json().get(coin_id)
+        r2 = session.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": coin_id, "vs_currencies": "usd,eur,gbp,jpy,cny,aed,try", "include_24hr_change": "true"},
+            timeout=10
+        )
+        if r2.status_code == 200:
+            data = r2.json().get(coin_id)
+            if data:
+                MULTI_PRICE_CACHE[symbol_up] = {"data": data, "timestamp": now}
+            return data
     except Exception as e:
         log(f"Multi price error: {e}", "ERROR")
     return None
@@ -300,19 +300,16 @@ def scan_ca(address):
     address = re.sub(r'[^a-zA-Z0-9]', '', address)
     try:
         if address.startswith("0x") and len(address) == 42:
-            url = f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={address}"
-            r = session.get(url, timeout=10)
+            r = session.get(f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={address}", timeout=10)
             if r.status_code == 200:
                 res = r.json().get("result", {}).get(address.lower(), {})
                 if res:
                     return res
-            url = f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={address}"
-            r = session.get(url, timeout=10)
+            r = session.get(f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={address}", timeout=10)
             if r.status_code == 200:
                 return r.json().get("result", {}).get(address.lower(), {})
         else:
-            url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={address}"
-            r = session.get(url, timeout=10)
+            r = session.get(f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={address}", timeout=10)
             if r.status_code == 200:
                 return r.json().get("result", {}).get(address, {})
     except Exception as e:
@@ -321,6 +318,8 @@ def scan_ca(address):
 
 # ================= PRICE FORMATTING =================
 def format_price(price):
+    if price is None:
+        return "N/A"
     if price >= 1:
         return f"${price:,.4f}"
     elif price >= 0.0001:
@@ -357,7 +356,8 @@ def websocket_loop():
     global active_ws, ws_restart_required, shutdown_flag
     while not shutdown_flag:
         try:
-            active_symbols = {a["coin"] for a in alerts if a.get("active", False)}
+            with lock:
+                active_symbols = {a["coin"] for a in alerts if a.get("active", False)}
             if not active_symbols:
                 time.sleep(10)
                 continue
@@ -388,7 +388,7 @@ threading.Thread(target=websocket_loop, daemon=True).start()
 # ================= ALERT CHECKER =================
 def check_alerts():
     last_triggered = {}
-    while True:
+    while not shutdown_flag:
         try:
             triggered = []
             with lock:
@@ -407,7 +407,8 @@ def check_alerts():
                     key = (a["chat_id"], a["id"])
                     if key in last_triggered and time.time() - last_triggered[key] < 300:
                         continue
-                    if (a["direction"] == ">" and price >= a["target"]) or (a["direction"] == "<" and price <= a["target"]):
+                    if (a["direction"] == ">" and price >= a["target"]) or \
+                       (a["direction"] == "<" and price <= a["target"]):
                         a["active"] = False
                         triggered.append((a, price))
                         last_triggered[key] = time.time()
@@ -417,7 +418,9 @@ def check_alerts():
                     label = "🚀 risen above" if a["direction"] == ">" else "📉 dropped below"
                     send_and_track(
                         a["chat_id"],
-                        f"🔔 *Alert #{a['id']} triggered!*\n\n*{a['coin']}* has {label} *${a['target']:,.2f}*\nCurrent price: *{format_price(price)}*",
+                        f"🔔 *Alert #{a['id']} triggered!*\n\n"
+                        f"*{a['coin']}* has {label} *${a['target']:,.2f}*\n"
+                        f"Current price: *{format_price(price)}*",
                         reply_markup=main_menu()
                     )
         except Exception as e:
@@ -430,14 +433,17 @@ threading.Thread(target=check_alerts, daemon=True).start()
 def memory_cleaner():
     while not shutdown_flag:
         try:
-            if len(PRICE_CACHE) > 500:
-                PRICE_CACHE.clear()
+            with lock:
+                if len(PRICE_CACHE) > 500:
+                    PRICE_CACHE.clear()
             if len(cooldowns) > 1000:
                 cooldowns.clear()
             if len(waiting_for) > 1000:
                 waiting_for.clear()
+            if len(MULTI_PRICE_CACHE) > 200:
+                MULTI_PRICE_CACHE.clear()
             for cid in list(user_msg_queue.keys()):
-                if len(user_msg_queue[cid]) > MAX_HISTORY:
+                if len(user_msg_queue.get(cid, [])) > MAX_HISTORY:
                     cleanup_old_messages(cid)
         except Exception as e:
             log(f"Memory cleaner error: {e}", "ERROR")
@@ -456,7 +462,7 @@ def main_menu():
 
 def price_menu():
     kb = InlineKeyboardMarkup()
-    coins = ["BTC","ETH","BNB","SOL","XRP","DOGE","ADA","AVAX","LINK","MATIC","UNI","ATOM","NEAR","APT","SUI","LTC","SHIB"]
+    coins = ["BTC","ETH","BNB","SOL","XRP","DOGE","ADA","AVAX","LINK","MATIC","UNI","ATOM","NEAR","APT","SUI","LTC","SHIB","TRX","TON","ARB","OP","INJ","TIA","DOT"]
     row = []
     for i, coin in enumerate(coins, 1):
         row.append(InlineKeyboardButton(coin, callback_data=f"price_{coin}"))
@@ -474,6 +480,8 @@ def alerts_menu():
     kb.row(InlineKeyboardButton("BTC > 100k", callback_data="setalert_BTC_>_100000"), InlineKeyboardButton("BTC < 80k", callback_data="setalert_BTC_<_80000"))
     kb.row(InlineKeyboardButton("ETH > 4k", callback_data="setalert_ETH_>_4000"), InlineKeyboardButton("ETH < 2k", callback_data="setalert_ETH_<_2000"))
     kb.row(InlineKeyboardButton("SOL > 200", callback_data="setalert_SOL_>_200"), InlineKeyboardButton("SOL < 100", callback_data="setalert_SOL_<_100"))
+    kb.row(InlineKeyboardButton("BNB > 700", callback_data="setalert_BNB_>_700"), InlineKeyboardButton("BNB < 500", callback_data="setalert_BNB_<_500"))
+    kb.row(InlineKeyboardButton("XRP > 3", callback_data="setalert_XRP_>_3"), InlineKeyboardButton("XRP < 1", callback_data="setalert_XRP_<_1"))
     kb.row(InlineKeyboardButton("✏️ Custom alert", callback_data="custom_alert"))
     kb.row(InlineKeyboardButton("📋 My Alerts", callback_data="list_alerts"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
@@ -513,27 +521,26 @@ def stats_command(msg):
             send_and_track(msg.chat.id, "No analytics data yet.")
             return
         with open(ANALYTICS_FILE, 'r') as f:
-            reader = csv.reader(f)
-            rows = list(reader)
+            rows = list(csv.reader(f))
         if len(rows) <= 1:
             send_and_track(msg.chat.id, "No user interactions logged.")
             return
-        total_interactions = len(rows) - 1
-        unique_users = len(set(row[1] for row in rows[1:]))
+        total = len(rows) - 1
+        unique = len(set(r[1] for r in rows[1:]))
         cmd_counts = {}
-        for row in rows[1:]:
-            cmd = row[4]
-            cmd_counts[cmd] = cmd_counts.get(cmd, 0) + 1
+        for r in rows[1:]:
+            cmd_counts[r[4]] = cmd_counts.get(r[4], 0) + 1
         most_used = max(cmd_counts.items(), key=lambda x: x[1]) if cmd_counts else ("None", 0)
-        stats_text = (
+        active_alerts = len([a for a in alerts if a.get("active", False)])
+        send_and_track(msg.chat.id,
             f"📊 *Bot Analytics*\n\n"
-            f"👥 Unique users: {unique_users}\n"
-            f"🔄 Total interactions: {total_interactions}\n"
-            f"🔥 Most used command: `{most_used[0]}` ({most_used[1]} times)"
+            f"👥 Unique users: {unique}\n"
+            f"🔄 Total interactions: {total}\n"
+            f"🔔 Active alerts: {active_alerts}\n"
+            f"🔥 Most used: `{most_used[0]}` ({most_used[1]} times)"
         )
-        send_and_track(msg.chat.id, stats_text)
     except Exception as e:
-        send_and_track(msg.chat.id, f"Error reading analytics: {e}")
+        send_and_track(msg.chat.id, f"Error: {e}")
 
 @bot.message_handler(commands=["users"])
 def users_command(msg):
@@ -546,33 +553,30 @@ def users_command(msg):
             send_and_track(msg.chat.id, "No users yet.")
             return
         with open(ANALYTICS_FILE, 'r') as f:
-            reader = csv.reader(f)
-            rows = list(reader)
-        if len(rows) <= 1:
-            send_and_track(msg.chat.id, "No users yet.")
-            return
+            rows = list(csv.reader(f))
         users = {}
-        for row in rows[1:]:
-            uid = row[1]
-            username = row[2]
-            name = row[3]
+        for r in rows[1:]:
+            uid = r[1]
             if uid not in users:
-                users[uid] = (username, name)
+                users[uid] = (r[2], r[3])
         if not users:
             send_and_track(msg.chat.id, "No users.")
             return
-        user_list = "\n".join([f"`{uid}` – {name} (@{username})" for uid, (username, name) in list(users.items())[:20]])
+        user_list = "\n".join([f"`{uid}` — {name} (@{uname})" for uid, (uname, name) in list(users.items())[:20]])
         if len(users) > 20:
             user_list += f"\n... and {len(users)-20} more"
-        send_and_track(msg.chat.id, f"👥 *Users (first 20)*\n\n{user_list}")
+        send_and_track(msg.chat.id, f"👥 *Users ({len(users)} total)*\n\n{user_list}")
     except Exception as e:
         send_and_track(msg.chat.id, f"Error: {e}")
 
 # ================= HANDLERS =================
-@bot.message_handler(commands=["start","help"])
+@bot.message_handler(commands=["start", "help"])
 def start(msg):
     log_interaction(msg.from_user.id, msg.from_user.username, msg.from_user.first_name, "/start")
-    send_and_track(msg.chat.id, "🤖 *Persona* — your crypto assistant\n\nChoose an option:", reply_markup=main_menu())
+    send_and_track(msg.chat.id,
+        "🤖 *Persona* — your crypto assistant\n\nChoose an option:",
+        reply_markup=main_menu()
+    )
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
@@ -580,15 +584,13 @@ def handle_callback(call):
     cid = call.message.chat.id
     data = call.data
     user_id = call.from_user.id
-    username = call.from_user.username
-    first_name = call.from_user.first_name
 
     if not cooldown_ok(user_id):
         bot.answer_callback_query(call.id, "⏳ Slow down")
         return
 
     bot.answer_callback_query(call.id)
-    log_interaction(user_id, username, first_name, f"callback:{data[:50]}")
+    log_interaction(user_id, call.from_user.username, call.from_user.first_name, f"callback:{data[:50]}")
 
     try:
         if data == "back_main":
@@ -612,33 +614,27 @@ def handle_callback(call):
         elif data.startswith("setalert_"):
             parts = data.split("_")
             if len(parts) != 4:
-                send_and_track(cid, "❌ Invalid preset alert.", reply_markup=alerts_menu())
+                send_and_track(cid, "❌ Invalid alert.", reply_markup=alerts_menu())
                 return
             _, sym, dir, t = parts
             try:
                 target = float(t)
             except ValueError:
-                send_and_track(cid, "❌ Invalid price value.", reply_markup=alerts_menu())
+                send_and_track(cid, "❌ Invalid price.", reply_markup=alerts_menu())
                 return
-            if dir not in ('>', '<'):
-                send_and_track(cid, "❌ Invalid direction.", reply_markup=alerts_menu())
-                return
-            with lock:
-                user_alerts = [a for a in alerts if a["chat_id"] == cid and a.get("active", True)]
-                if len(user_alerts) >= MAX_ALERTS_PER_USER:
-                    send_and_track(cid, f"❌ You have reached the limit of {MAX_ALERTS_PER_USER} active alerts.", reply_markup=alerts_menu())
-                    return
-                alerts.append({
-                    "id": alert_id_counter,
-                    "chat_id": cid,
-                    "coin": sym.upper(),
-                    "target": target,
-                    "direction": dir,
-                    "active": True,
-                    "timestamp": time.time()
-                })
-                cur = alert_id_counter
-                alert_id_counter += 1
+            with alert_counter_lock:
+                with lock:
+                    user_alerts = [a for a in alerts if a["chat_id"] == cid and a.get("active", True)]
+                    if len(user_alerts) >= MAX_ALERTS_PER_USER:
+                        send_and_track(cid, f"❌ Max {MAX_ALERTS_PER_USER} active alerts allowed.", reply_markup=alerts_menu())
+                        return
+                    cur = alert_id_counter
+                    alert_id_counter += 1
+                    alerts.append({
+                        "id": cur, "chat_id": cid, "coin": sym.upper(),
+                        "target": target, "direction": dir,
+                        "active": True, "timestamp": time.time()
+                    })
             save_alerts()
             ws_restart_required = True
             send_and_track(cid, f"✅ Alert #{cur} set!\n*{sym.upper()}* {dir} *${target:,.2f}*", reply_markup=alerts_menu())
@@ -663,9 +659,9 @@ def handle_callback(call):
                 for a in alerts:
                     if a.get('id') == aid and a.get('chat_id') == cid:
                         a['active'] = False
-                        save_alerts()
-                        ws_restart_required = True
                         break
+            save_alerts()
+            ws_restart_required = True
             active = [a for a in alerts if a.get("chat_id") == cid and a.get("active", True)]
             if not active:
                 send_and_track(cid, "📋 No more active alerts.", reply_markup=back_button())
@@ -696,8 +692,7 @@ def handle_callback(call):
                 text = "🚀 *Top 5 Gainers (24h)*\n\n"
                 for d in g:
                     coin = d["symbol"].replace("USDT", "")
-                    p = float(d['lastPrice'])
-                    text += f"🟢 *{coin}* — {format_price(p)} ▲ {float(d['priceChangePercent']):.2f}%\n"
+                    text += f"🟢 *{coin}* — {format_price(float(d['lastPrice']))} ▲ {float(d['priceChangePercent']):.2f}%\n"
                 send_and_track(cid, text, reply_markup=back_button())
 
         elif data == "losers":
@@ -708,8 +703,7 @@ def handle_callback(call):
                 text = "📉 *Top 5 Losers (24h)*\n\n"
                 for d in l:
                     coin = d["symbol"].replace("USDT", "")
-                    p = float(d['lastPrice'])
-                    text += f"🔴 *{coin}* — {format_price(p)} ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
+                    text += f"🔴 *{coin}* — {format_price(float(d['lastPrice']))} ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
                 send_and_track(cid, text, reply_markup=back_button())
 
         elif data == "menu_info":
@@ -738,7 +732,8 @@ def handle_callback(call):
                     f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
                     f"📊 Volume 24h: ${info['volume']:,.0f}\n"
                     f"🔄 Supply: {supply_str} / {max_str}",
-                    reply_markup=info_coins_menu())
+                    reply_markup=info_coins_menu()
+                )
 
         elif data == "menu_multi":
             send_and_track(cid, "💱 *Multi-Currency Price — Select or search:*", reply_markup=multi_coins_menu())
@@ -753,12 +748,12 @@ def handle_callback(call):
             if not prices:
                 send_and_track(cid, f"❌ Couldn't fetch *{sym}*.", reply_markup=multi_coins_menu())
             else:
-                flags = {"usd":"🇺🇸 $","eur":"🇪🇺 €","gbp":"🇬🇧 £","jpy":"🇯🇵 ¥","cny":"🇨🇳 ¥","aed":"🇦🇪 د.إ","try":"🇹🇷 ₺"}
+                flags = {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £", "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ", "try": "🇹🇷 ₺"}
                 text = f"💱 *{sym} Price*\n\n"
                 for cur, flag in flags.items():
                     p = prices.get(cur)
                     if p:
-                        text += f"{flag} {format_price(p)}\n"
+                        text += f"{flag}{format_price(p)}\n"
                 send_and_track(cid, text, reply_markup=multi_coins_menu())
 
         elif data == "menu_scan":
@@ -768,26 +763,24 @@ def handle_callback(call):
     except Exception as e:
         log(f"Callback error: {e}", "ERROR")
         try:
-            send_and_track(cid, "⚠️ An internal error occurred. Please try again.", reply_markup=main_menu())
+            send_and_track(cid, "⚠️ An error occurred. Please try again.", reply_markup=main_menu())
         except:
             pass
 
-# ================= TEXT INPUT HANDLER =================
+# ================= TEXT INPUT =================
 @bot.message_handler(func=lambda msg: True)
 def text_input(msg):
     global alert_id_counter, ws_restart_required
     cid = msg.chat.id
     user_id = msg.from_user.id
-    username = msg.from_user.username
-    first_name = msg.from_user.first_name
     if cid not in waiting_for:
         return
     mode = waiting_for.pop(cid)
     text = msg.text.strip()
-    log_interaction(user_id, username, first_name, f"text:{mode}", text[:100])
+    log_interaction(user_id, msg.from_user.username, msg.from_user.first_name, f"text:{mode}", text[:100])
 
     if not text:
-        send_and_track(cid, "❌ Empty input. Please try again.", reply_markup=back_button())
+        send_and_track(cid, "❌ Empty input.", reply_markup=back_button())
         return
 
     try:
@@ -817,24 +810,25 @@ def text_input(msg):
                     f"💰 Market Cap: ${info['market_cap']:,.0f}\n"
                     f"📊 Volume 24h: ${info['volume']:,.0f}\n"
                     f"🔄 Supply: {supply_str} / {max_str}",
-                    reply_markup=info_coins_menu())
+                    reply_markup=info_coins_menu()
+                )
 
         elif mode == "multi":
             prices = get_multi_price(text.upper())
             if not prices:
                 send_and_track(cid, f"❌ *{text.upper()}* not found.", reply_markup=multi_coins_menu())
             else:
-                flags = {"usd":"🇺🇸 $","eur":"🇪🇺 €","gbp":"🇬🇧 £","jpy":"🇯🇵 ¥","cny":"🇨🇳 ¥","aed":"🇦🇪 د.إ","try":"🇹🇷 ₺"}
+                flags = {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £", "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ", "try": "🇹🇷 ₺", "etb": "🇪🇹 E"}
                 out = f"💱 *{text.upper()} Price*\n\n"
                 for cur, flag in flags.items():
                     p = prices.get(cur)
                     if p:
-                        out += f"{flag} {format_price(p)}\n"
+                        out += f"{flag}{format_price(p)}\n"
                 send_and_track(cid, out, reply_markup=multi_coins_menu())
 
         elif mode == "scan":
             if len(text) > MAX_CA_LENGTH:
-                send_and_track(cid, f"❌ Contract address too long (max {MAX_CA_LENGTH} chars).", reply_markup=back_button())
+                send_and_track(cid, f"❌ Address too long (max {MAX_CA_LENGTH} chars).", reply_markup=back_button())
                 return
             res = scan_ca(text)
             if not res:
@@ -853,7 +847,8 @@ def text_input(msg):
                     f"💸 Buy Tax: {res.get('buy_tax','?')}%\n"
                     f"💸 Sell Tax: {res.get('sell_tax','?')}%\n"
                     f"👥 Holders: {res.get('holder_count','?')}",
-                    reply_markup=back_button())
+                    reply_markup=back_button()
+                )
 
         elif mode == "alert":
             parts = text.split()
@@ -867,29 +862,26 @@ def text_input(msg):
             except ValueError:
                 send_and_track(cid, "❌ Invalid price value.", reply_markup=alerts_menu())
                 return
-            with lock:
-                user_alerts = [a for a in alerts if a["chat_id"] == cid and a.get("active", True)]
-                if len(user_alerts) >= MAX_ALERTS_PER_USER:
-                    send_and_track(cid, f"❌ You have reached the limit of {MAX_ALERTS_PER_USER} active alerts.", reply_markup=alerts_menu())
-                    return
-                alerts.append({
-                    "id": alert_id_counter,
-                    "chat_id": cid,
-                    "coin": sym,
-                    "target": target,
-                    "direction": dir,
-                    "active": True,
-                    "timestamp": time.time()
-                })
-                cur = alert_id_counter
-                alert_id_counter += 1
+            with alert_counter_lock:
+                with lock:
+                    user_alerts = [a for a in alerts if a["chat_id"] == cid and a.get("active", True)]
+                    if len(user_alerts) >= MAX_ALERTS_PER_USER:
+                        send_and_track(cid, f"❌ Max {MAX_ALERTS_PER_USER} active alerts allowed.", reply_markup=alerts_menu())
+                        return
+                    cur = alert_id_counter
+                    alert_id_counter += 1
+                    alerts.append({
+                        "id": cur, "chat_id": cid, "coin": sym,
+                        "target": target, "direction": dir,
+                        "active": True, "timestamp": time.time()
+                    })
             save_alerts()
             ws_restart_required = True
             send_and_track(cid, f"🔔 Alert #{cur} set!\n*{sym}* {dir} *${target:,.2f}*", reply_markup=alerts_menu())
 
     except Exception as e:
         log(f"Text handler error: {e}", "ERROR")
-        send_and_track(cid, "⚠️ An error occurred processing your request.", reply_markup=main_menu())
+        send_and_track(cid, "⚠️ An error occurred.", reply_markup=main_menu())
 
 # ================= GRACEFUL SHUTDOWN =================
 def signal_handler(sig, frame):
@@ -904,10 +896,10 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# ================= START BOT =================
+# ================= START =================
 init_analytics()
-log("🚀 Persona — Production ready with user tracking")
-bot.delete_webhook()  # Clear any previous webhook/polling conflict
+log("🚀 Persona — Production ready")
+bot.delete_webhook()
 while not shutdown_flag:
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
