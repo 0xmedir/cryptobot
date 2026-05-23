@@ -536,7 +536,6 @@ def cooldown_ok(uid):
 def start(m):
     log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
     text, kb = main_menu()
-    # Send new message, we don't track editing for start
     bot.send_message(m.chat.id, text, reply_markup=kb)
 
 @bot.message_handler(commands=["stats"])
@@ -739,7 +738,6 @@ def cb(call):
             new_id = edit_or_send(cid, text, back_button(), msg_id)
             current_msg[cid] = new_id
         else:
-            # unknown callback – ignore
             pass
     except Exception as e:
         log.error(f"Callback error: {e}", exc_info=True)
@@ -754,13 +752,18 @@ def text_input(m):
         return
     with wait_lock:
         if cid not in waiting:
-            # ignore unknown commands (silent)
             return
         mode = waiting.pop(cid)
 
     t = m.text.strip()[:MAX_TEXT_LEN]
     if not t:
         return
+
+    # [NEW] Try to delete the user's message (works only in groups where bot is admin)
+    try:
+        bot.delete_message(cid, m.message_id)
+    except Exception:
+        pass  # Fails silently in private chats
 
     log_interaction(uid, m.from_user.username, m.from_user.first_name, f"text:{mode}", t)
 
@@ -859,6 +862,6 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Persona Bot – Clean UI, Fast, Reliable")
+log.info("🚀 Persona Bot – Clean UI, Fast, Reliable (with user message deletion attempt)")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
