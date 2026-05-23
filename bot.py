@@ -281,7 +281,7 @@ def get_multi_price(symbol):
         coin_id = coins[0]["id"]
         r2 = session.get(
             "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": coin_id, "vs_currencies": "usd,eur,gbp,jpy,cny,aed,try,etb", "include_24hr_change": "true"},
+            params={"ids": coin_id, "vs_currencies": "usd,eur,gbp,jpy,cny,aed,try", "include_24hr_change": "true"},
             timeout=10
         )
         if r2.status_code == 200:
@@ -748,16 +748,12 @@ def handle_callback(call):
             if not prices:
                 send_and_track(cid, f"❌ Couldn't fetch *{sym}*.", reply_markup=multi_coins_menu())
             else:
-                flags = {
-                    "usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £",
-                    "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ",
-                    "try": "🇹🇷 ₺", "etb": "🇪🇹 Br"
-                }
+                flags = {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £", "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ", "try": "🇹🇷 ₺"}
                 text = f"💱 *{sym} Price*\n\n"
                 for cur, flag in flags.items():
                     p = prices.get(cur)
                     if p:
-                        text += f"{flag} {format_price(p)}\n"
+                        text += f"{flag}{format_price(p)}\n"
                 send_and_track(cid, text, reply_markup=multi_coins_menu())
 
         elif data == "menu_scan":
@@ -771,11 +767,7 @@ def handle_callback(call):
         except:
             pass
 
-flags = {
-                    "usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £",
-                    "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ",
-                    "try": "🇹🇷 ₺", "etb": "🇪🇹 Br"
-                }# ================= TEXT INPUT =================
+# ================= TEXT INPUT =================
 @bot.message_handler(func=lambda msg: True)
 def text_input(msg):
     global alert_id_counter, ws_restart_required
@@ -826,16 +818,12 @@ def text_input(msg):
             if not prices:
                 send_and_track(cid, f"❌ *{text.upper()}* not found.", reply_markup=multi_coins_menu())
             else:
-                flags =
-                    {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £",
-                    "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ",
-                    "try": "🇹🇷 ₺"}
-
+                flags = {"usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £", "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ", "try": "🇹🇷 ₺"}
                 out = f"💱 *{text.upper()} Price*\n\n"
                 for cur, flag in flags.items():
                     p = prices.get(cur)
                     if p:
-                        out += f"{flag} {format_price(p)}\n"
+                        out += f"{flag}{format_price(p)}\n"
                 send_and_track(cid, out, reply_markup=multi_coins_menu())
 
         elif mode == "scan":
