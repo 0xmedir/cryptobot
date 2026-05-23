@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+Persona Bot – Focused: Alerts, Price Tools, Scanner (Improved)
+"""
+
 import telebot
 import requests
 import threading
@@ -211,25 +216,61 @@ class CoinGecko:
         except:
             return None
 
+# ================= IMPROVED CONTRACT SCANNER =================
 class GoPlus:
     @staticmethod
     def scan(address):
-        if len(address) > MAX_CA_LENGTH: return None
-        clean = re.sub(r'[^a-zA-Z0-9]', '', address)
-        if address.startswith("0x"): clean = "0x" + clean
+        if len(address) > MAX_CA_LENGTH:
+            return None, "Address too long"
+
+        # Normalise address
+        orig = address
+        address = address.strip()
+        # Keep original case? GoPlus expects lowercase
+        address_lower = address.lower()
+        # Remove any non-hex characters (except 0x)
+        clean = re.sub(r'[^a-f0-9]', '', address_lower)
+        if address_lower.startswith("0x"):
+            clean = "0x" + clean
+        else:
+            # Solana addresses are base58, keep as is but clean
+            clean = re.sub(r'[^a-zA-Z0-9]', '', address)
+
+        # Rate limit protection: wait a bit before hitting the API
+        time.sleep(0.3)
+
         try:
-            if clean.startswith("0x") and len(clean)==42:
-                for chain in [1,56]:
-                    r = session.get(f"https://api.gopluslabs.io/api/v1/token_security/{chain}?contract_addresses={clean}", timeout=10)
-                    if r.status_code == 200:
-                        res = r.json().get("result",{}).get(clean.lower(),{})
-                        if res: return res
-            else:
-                r = session.get(f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={clean}", timeout=10)
+            if clean.startswith("0x") and len(clean) == 42:
+                # Try Ethereum first
+                url = f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={clean}"
+                r = session.get(url, timeout=15)
                 if r.status_code == 200:
-                    return r.json().get("result",{}).get(clean,{})
-        except: pass
-        return None
+                    data = r.json()
+                    result = data.get("result", {}).get(clean, {})
+                    if result:
+                        return result, None
+                    # Try BSC
+                    url = f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={clean}"
+                    r = session.get(url, timeout=15)
+                    if r.status_code == 200:
+                        data = r.json()
+                        result = data.get("result", {}).get(clean, {})
+                        if result:
+                            return result, None
+                return None, "Contract not found on Ethereum or BSC (check address)"
+            else:
+                # Solana (GoPlus supports)
+                url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={clean}"
+                r = session.get(url, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    result = data.get("result", {}).get(clean, {})
+                    if result:
+                        return result, None
+                return None, "Solana token not found or not verified"
+        except Exception as e:
+            log.error(f"GoPlus scan error: {e}")
+            return None, "API error – try again later"
 
 # ================= USER PROFILES =================
 def get_profile(user_id):
@@ -623,11 +664,19 @@ def text_input(m):
                     if p: out += f"{flag} {fmt_price(p)}\n"
                 send_and_track(cid, out, multi_menu()[1])
         elif mode == "scan":
-            res = GoPlus.scan(t)
-            if not res: send_and_track(cid, "❌ No contract data", back_button())
+            result, err = GoPlus.scan(t)
+            if err:
+                send_and_track(cid, f"❌ {err}", back_button())
             else:
                 def f(v): return "⚠️ Yes" if v=="1" else "✅ No" if v=="0" else "❓ Unknown"
-                out = f"🛡 CA Scan\n{separator()}\nHoneypot: {f(res.get('is_honeypot','?'))}\nMintable: {f(res.get('is_mintable','?'))}\nProxy: {f(res.get('is_proxy','?'))}\nBuy Tax: {res.get('buy_tax','?')}%\nSell Tax: {res.get('sell_tax','?')}%"
+                out = f"🛡 *CA Scan*\n{separator()}\n"
+                out += f"🍯 Honeypot: {f(result.get('is_honeypot','?'))}\n"
+                out += f"🖨 Mintable: {f(result.get('is_mintable','?'))}\n"
+                out += f"🔁 Proxy: {f(result.get('is_proxy','?'))}\n"
+                out += f"📂 Open Source: {f(result.get('is_open_source','?'))}\n"
+                out += f"💸 Buy Tax: {result.get('buy_tax','?')}%\n"
+                out += f"💸 Sell Tax: {result.get('sell_tax','?')}%\n"
+                out += f"👥 Holders: {result.get('holder_count','?')}"
                 send_and_track(cid, out, back_button())
         elif mode == "alert":
             parts = t.split()
@@ -655,6 +704,6 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Persona Bot – Alerts | Price | Scanner")
+log.info("🚀 Persona Bot – Alerts | Price | Scanner (Improved)")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
