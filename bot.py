@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+Persona Bot – 10 coins grid, search any coin, admin user details
+Menu text: "Scan CA", "multi currencies"
+"""
+
 import telebot
 import requests
 import threading
@@ -148,7 +154,6 @@ class Binance:
             return [], []
 
 class CoinGecko:
-    # Only used for internal mapping; search handles everything else
     COIN_MAP = {
         "BTC":"bitcoin","ETH":"ethereum","BNB":"binancecoin","SOL":"solana","XRP":"ripple",
         "DOGE":"dogecoin","ADA":"cardano","AVAX":"avalanche-2","LINK":"chainlink","MATIC":"matic-network"
@@ -159,10 +164,8 @@ class CoinGecko:
         cached = coin_cache.get(sym_up)
         if cached:
             return cached
-        # Try direct map first
         coin_id = CoinGecko.COIN_MAP.get(sym_up)
         if not coin_id:
-            # Search
             try:
                 r = session.get(f"https://api.coingecko.com/api/v3/search?query={symbol.lower()}", timeout=10)
                 if r.status_code != 200:
@@ -430,7 +433,7 @@ def send_and_track(chat_id, text, markup=None):
                 pass
     return sent
 
-# ================= KEYBOARDS (10 coins only) =================
+# ================= KEYBOARDS (with updated button texts) =================
 def main_menu():
     text = "🤖 **PERSONA**\n\nYour crypto terminal\n\n"
     kb = InlineKeyboardMarkup()
@@ -444,10 +447,10 @@ def main_menu():
     )
     kb.row(
         InlineKeyboardButton("🔎 Coin Info", callback_data="menu_info"),
-        InlineKeyboardButton("💱 Multi", callback_data="menu_multi")
+        InlineKeyboardButton("💱 multi currencies", callback_data="menu_multi")
     )
     kb.row(
-        InlineKeyboardButton("🛡 Scan", callback_data="menu_scan"),
+        InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"),
         InlineKeyboardButton("📋 My Alerts", callback_data="list_alerts")
     )
     kb.row(
@@ -508,7 +511,7 @@ def info_menu():
     return text, kb
 
 def multi_menu():
-    text = "💱 **Multi‑Currency**\n\nSelect a coin or search:"
+    text = "💱 **multi currencies**\n\nSelect a coin or search:"
     kb = InlineKeyboardMarkup()
     coins = ["BTC","ETH","BNB","SOL","XRP","ADA","MATIC"]
     row = []
@@ -770,7 +773,7 @@ def cb(call):
                     "aed": ("🇦🇪 AED", "aed"),
                     "try": ("🇹🇷 TRY", "try")
                 }
-                text = f"💱 **{sym} Multi‑Currency**\n\n"
+                text = f"💱 **{sym} multi currencies**\n\n"
                 for key, (flag, _) in cur_map.items():
                     val = prices.get(key)
                     if val is not None:
@@ -780,7 +783,7 @@ def cb(call):
         elif data == "menu_scan":
             with wait_lock:
                 waiting[cid] = "scan"
-            send_and_track(cid, "🛡 **Contract Scanner**\n\nSend address (ETH/BSC/Solana):", back_button())
+            send_and_track(cid, "🛡 **Scan CA**\n\nSend contract address (ETH/BSC/Solana):", back_button())
         elif data == "profile":
             p = get_profile(uid)
             text = (f"👤 **Profile**\n\n"
@@ -856,7 +859,7 @@ def text_input(m):
                     "aed": ("🇦🇪 AED", "aed"),
                     "try": ("🇹🇷 TRY", "try")
                 }
-                text = f"💱 **{escape_md(t)} Multi‑Currency**\n\n"
+                text = f"💱 **{escape_md(t)} multi currencies**\n\n"
                 for key, (flag, _) in cur_map.items():
                     val = prices.get(key)
                     if val is not None:
@@ -872,7 +875,10 @@ def text_input(m):
                     if v == "1": return "⚠️ Yes"
                     if v == "0": return "✅ No"
                     return "❓ Unknown"
+                token_name = result.get('token_name', 'Unknown')
+                token_symbol = result.get('token_symbol', '?')
                 text = (f"🛡 **CA Scan**\n\n"
+                        f"📛 Name: {token_name} ({token_symbol})\n"
                         f"🍯 Honeypot: {flag(result.get('is_honeypot','?'))}\n"
                         f"🖨 Mintable: {flag(result.get('is_mintable','?'))}\n"
                         f"🔁 Proxy: {flag(result.get('is_proxy','?'))}\n"
@@ -916,6 +922,6 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Persona Bot – 10 coins grid, search any coin, admin user details")
+log.info("🚀 Persona Bot – 10 coins grid, search any coin, admin user details, updated menu labels")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
