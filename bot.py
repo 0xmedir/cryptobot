@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final (Short descriptions, admin sees usernames)
+Persona Bot – Real‑time prices (TTL 3s, WS always active)
 """
 
 import telebot
@@ -43,7 +43,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
 # =========================
-# DATABASE (auto‑migration to add username/name)
+# DATABASE (auto‑migration)
 # =========================
 db_path = "data/persona.db"
 db_lock = threading.RLock()
@@ -75,7 +75,6 @@ def db_query(query, params=(), fetch_one=False, fetch_all=False, retries=3):
     return None
 
 def init_db():
-    # Migrate old schema (drop streak, add username/first_name)
     try:
         cur = conn.cursor()
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='profiles'")
@@ -130,7 +129,7 @@ def init_db():
 init_db()
 
 # =========================
-# CACHE
+# CACHE (TTL = 3 seconds for real‑time)
 # =========================
 class TTLCache:
     def __init__(self, default_ttl=60):
@@ -154,7 +153,7 @@ class TTLCache:
                 return None
             return value
 
-price_cache = TTLCache(10)
+price_cache = TTLCache(3)   # <-- FASTER: 3 seconds instead of 10
 coin_cache = TTLCache(3600)
 
 # =========================
@@ -259,7 +258,7 @@ def is_admin(uid):
     return uid in ADMIN_IDS
 
 # =========================
-# SERVICES (Binance, CoinGecko, Scanner)
+# SERVICES
 # =========================
 class Binance:
     @staticmethod
@@ -272,7 +271,7 @@ class Binance:
             data = r.json()
             price = float(data["lastPrice"])
             change = float(data["priceChangePercent"])
-            price_cache.set(f"{symbol}_binance", price, ttl=10)
+            price_cache.set(f"{symbol}_binance", price, ttl=3)
             return price, change
         except Exception as e:
             log.error(f"Binance price error {symbol}: {e}")
@@ -399,7 +398,7 @@ class CoinGecko:
 def live_price(symbol):
     cached = price_cache.get(f"{symbol.upper()}_binance")
     if cached is not None:
-        return cached, None, "Binance(cache)"
+        return cached, None, "Binance"
     p, ch = Binance.price(symbol)
     if p is not None:
         return p, ch, "Binance"
@@ -497,7 +496,7 @@ def get_alert_count(chat_id):
     return row[0] if row else 0
 
 # =========================
-# WEBSOCKET PRICE FEED
+# WEBSOCKET PRICE FEED (always active)
 # =========================
 ws_restart = threading.Event()
 ws_restart.set()
@@ -511,11 +510,9 @@ def ws_loop():
         try:
             alerts = get_active_alerts()
             symbols = sorted({a["coin"].upper() for a in alerts})
+            # Always keep WebSocket alive with at least one symbol
             if not symbols:
-                time.sleep(5)
-                backoff = 1
-                continue
-
+                symbols = ["BTC"]
             streams = "/".join([f"{s.lower()}usdt@ticker" for s in symbols[:50]])
             if not streams:
                 time.sleep(5)
@@ -531,7 +528,7 @@ def ws_loop():
                         return
                     t = d["data"]
                     symbol = t["s"].replace("USDT", "")
-                    price_cache.set(f"{symbol}_binance", float(t["c"]), ttl=10)
+                    price_cache.set(f"{symbol}_binance", float(t["c"]), ttl=3)
                 except:
                     pass
 
@@ -625,11 +622,11 @@ def send_and_track(chat_id, text, markup=None):
     return sent
 
 # =========================
-# UI / MENUS (shorter descriptions)
+# UI / MENUS (short descriptions)
 # =========================
 def back_button():
     kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
     return kb
 
 def coin_grid(prefix, coins):
@@ -645,10 +642,7 @@ def coin_grid(prefix, coins):
     return kb
 
 def main_menu():
-    text = (
-        "🤖  <b>PERSONA</b>\n\n"
-        "Fast crypto tools: prices, alerts, intel."
-    )
+    text = "⚡ <b>PERSONA</b>\n\nFast crypto tools: prices, alerts, intel."
     kb = InlineKeyboardMarkup()
     kb.row(
         InlineKeyboardButton("💰 Price check", callback_data="menu_price"),
@@ -672,41 +666,28 @@ def main_menu():
     return text, kb
 
 def price_menu():
-    text = (
-        "💵 <b>Price Check</b>\n\n"
-        "Tap a coin or type a ticker.\n"
-        "Examples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>"
-    )
+    text = "💵 <b>Price Check</b>\n\nTap a coin or type a ticker.\nExamples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>"
     kb = coin_grid("price", ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "MATIC"])
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_price"))
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
     return text, kb
 
 def info_menu():
-    text = (
-        "🔎 <b>Coin Intel</b>\n\n"
-        "Pick a coin for rank, ATH/ATL, supply, market cap, and volume."
-    )
+    text = "🔎 <b>Coin Intel</b>\n\nPick a coin for rank, ATH/ATL, supply, market cap, and volume."
     kb = coin_grid("info", ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "MATIC"])
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_info"))
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
     return text, kb
 
 def multi_menu():
-    text = (
-        "💱 <b>Currency Matrix</b>\n\n"
-        "See a coin across multiple currencies."
-    )
+    text = "💱 <b>Currency Matrix</b>\n\nSee a coin across multiple currencies."
     kb = coin_grid("multi", ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "MATIC"])
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
     return text, kb
 
 def alerts_menu():
-    text = (
-        "🔔 <b>Alert Traps</b>\n\n"
-        "Drop a trigger and let the bot watch the tape."
-    )
+    text = "🔔 <b>Alert Traps</b>\n\nDrop a trigger and let the bot watch the tape."
     kb = InlineKeyboardMarkup()
     kb.row(
         InlineKeyboardButton("BTC > 100k", callback_data="setalert_BTC_>_100000"),
@@ -722,14 +703,11 @@ def alerts_menu():
     )
     kb.row(InlineKeyboardButton("✏️ Custom alert", callback_data="custom_alert"))
     kb.row(InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"))
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
     return text, kb
 
 def scan_menu():
-    text = (
-        "🛡 <b>Contract Scanner</b>\n\n"
-        "Paste contract address (ETH/BSC/Solana)"
-    )
+    text = "🛡 <b>Contract Scanner</b>\n\nPaste contract address (ETH/BSC/Solana)"
     return text, back_button()
 
 # =========================
@@ -854,7 +832,7 @@ def render_alert_list(chat_id):
         arrow = "▲" if a["direction"] == ">" else "▼"
         text += f"#{a['id']} <b>{h(a['coin'])}</b> {arrow} <b>${a['target']:,.2f}</b>\n"
         kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
     return text, kb
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -1206,6 +1184,6 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started (shorter descriptions, admin sees usernames)")
+log.info("🚀 Persona Bot started (real‑time: TTL 3s, WS always on)")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
