@@ -771,7 +771,11 @@ def handle_callback(call):
         except:
             pass
 
-# ================= TEXT INPUT =================
+flags = {
+                    "usd": "🇺🇸 $", "eur": "🇪🇺 €", "gbp": "🇬🇧 £",
+                    "jpy": "🇯🇵 ¥", "cny": "🇨🇳 ¥", "aed": "🇦🇪 د.إ",
+                    "try": "🇹🇷 ₺", "etb": "🇪🇹 Br"
+                }# ================= TEXT INPUT =================
 @bot.message_handler(func=lambda msg: True)
 def text_input(msg):
     global alert_id_counter, ws_restart_required
