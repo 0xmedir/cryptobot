@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final Production Version (Patched + Maintenance Mode + Announce)
-Fixes applied:
-  1. total_interactions race condition → SQL-level increment
-  2. waiting dict keyed by (chat_id, user_id) to prevent cross-user trigger
-  3. broadcast_cmd queries profiles instead of analytics
-  4. Alert quota enforced per user_id, not chat_id
-  5. get_profile INSERT OR IGNORE to prevent UNIQUE constraint crash
-  6. setalert_ callback uses maxsplit=3 to handle any ticker safely
-  7. WebSocket on_message bare except replaced with specific error logging
-Added:
-  8. Maintenance mode — /maintenance on <msg> / /maintenance off
-     Users receive the maintenance announcement on any interaction.
-     Admins bypass maintenance and can still use the bot normally.
-  9. /announce command for custom broadcasts.
+Persona Bot – Final Production Version
+- Only /announce for mass messages (no duplicate /broadcast)
+- Multi‑currency supports search any coin
+- Maintenance mode, all critical fixes applied
 """
 
 import telebot
@@ -243,10 +233,6 @@ def set_maintenance(active, message=""):
     db_query("UPDATE maintenance SET active=?, message=? WHERE id=1", (1 if active else 0, message))
 
 def maintenance_block(uid, cid):
-    """
-    Returns True and sends the maintenance message if maintenance is active
-    and the user is not an admin. Call at the top of every handler.
-    """
     if is_admin(uid):
         return False
     active, msg = get_maintenance()
@@ -713,7 +699,7 @@ def cooldown_ok(uid):
     return True
 
 # =========================
-# ADMIN COMMANDS (including maintenance and announce)
+# ADMIN COMMANDS (including announce, no broadcast)
 # =========================
 @bot.message_handler(commands=["stats"])
 def stats_cmd(m):
@@ -747,38 +733,6 @@ def users_cmd(m):
     text = "👥 <b>Users</b>\n\n" + "\n".join(lines)
     send_and_track(m.chat.id, text, back_button())
 
-@bot.message_handler(commands=["broadcast"])
-def broadcast_cmd(m):
-    if not is_admin(m.from_user.id):
-        return
-    msg_text = m.text.partition(" ")[2].strip()
-    if not msg_text:
-        send_and_track(m.chat.id, "Usage: <code>/broadcast your message</code>", back_button())
-        return
-    rows = db_query("SELECT DISTINCT user_id FROM profiles", fetch_all=True)
-    if not rows:
-        send_and_track(m.chat.id, "No users to broadcast.", back_button())
-        return
-    sent_count = 0
-    fail_count = 0
-    for (uid,) in rows:
-        try:
-            bot.send_message(uid, f"📢 <b>Broadcast</b>\n\n{h(msg_text)}")
-            sent_count += 1
-            time.sleep(0.05)
-        except Exception as e:
-            log.error(f"Broadcast failed to {uid}: {e}")
-            fail_count += 1
-    send_and_track(m.chat.id, f"📡 Sent to <b>{sent_count}</b> users. Failed: <b>{fail_count}</b>", back_button())
-
-@bot.message_handler(commands=["clear_alerts"])
-def clear_alerts_cmd(m):
-    if not is_admin(m.from_user.id):
-        return
-    db_query("UPDATE alerts SET active=0 WHERE active=1")
-    rebuild_ws()
-    send_and_track(m.chat.id, "✅ All active alerts have been cleared.", back_button())
-
 @bot.message_handler(commands=["announce"])
 def announce_cmd(m):
     if not is_admin(m.from_user.id):
@@ -803,6 +757,14 @@ def announce_cmd(m):
             failed += 1
     send_and_track(m.chat.id, f"📢 Announcement sent to <b>{sent}</b> users. Failed: <b>{failed}</b>", back_button())
 
+@bot.message_handler(commands=["clear_alerts"])
+def clear_alerts_cmd(m):
+    if not is_admin(m.from_user.id):
+        return
+    db_query("UPDATE alerts SET active=0 WHERE active=1")
+    rebuild_ws()
+    send_and_track(m.chat.id, "✅ All active alerts have been cleared.", back_button())
+
 @bot.message_handler(commands=["maintenance"])
 def maintenance_cmd(m):
     if not is_admin(m.from_user.id):
@@ -821,7 +783,6 @@ def maintenance_cmd(m):
         custom_msg = " ".join(args[2:]) if len(args) > 2 else None
         set_maintenance(True, custom_msg or "")
         msg_to_broadcast = custom_msg or "Bot is under maintenance. We'll be back shortly."
-        # Broadcast to all users
         rows = db_query("SELECT DISTINCT user_id FROM profiles", fetch_all=True)
         sent = 0
         for (uid,) in rows:
@@ -834,7 +795,6 @@ def maintenance_cmd(m):
         send_and_track(m.chat.id, f"✅ Maintenance mode enabled. Broadcast sent to {sent} users.", back_button())
     elif action == "off":
         set_maintenance(False, "")
-        # Broadcast back online
         rows = db_query("SELECT DISTINCT user_id FROM profiles", fetch_all=True)
         sent = 0
         for (uid,) in rows:
@@ -849,7 +809,7 @@ def maintenance_cmd(m):
         send_and_track(m.chat.id, "Unknown action. Use on/off/status.", back_button())
 
 # =========================
-# START / HELP (with maintenance block)
+# START / HELP
 # =========================
 @bot.message_handler(commands=["start", "help"])
 def start(m):
@@ -860,7 +820,7 @@ def start(m):
     send_and_track(m.chat.id, text, kb)
 
 # =========================
-# CALLBACKS (with maintenance block)
+# CALLBACKS
 # =========================
 waiting = {}
 wait_lock = threading.RLock()
@@ -1068,7 +1028,7 @@ def cb(call):
         send_and_track(cid, "⚠️ Something broke.", back_button())
 
 # =========================
-# TEXT INPUT (with maintenance block)
+# TEXT INPUT
 # =========================
 @bot.message_handler(func=lambda m: True)
 def text_handler(message):
@@ -1212,6 +1172,6 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started (all fixes + maintenance mode + announce)")
+log.info("🚀 Persona Bot started (only /announce, multi‑currency search works)")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
