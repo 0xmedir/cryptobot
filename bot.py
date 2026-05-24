@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final Production Version (UI updates: Coin info, Currencies, Back)
+Persona Bot – Final with Live Price Ticker
 """
 
 import telebot
@@ -517,7 +517,7 @@ def get_alert_count(user_id):
     return row[0] if row else 0
 
 # =========================
-# WEBSOCKET
+# WEBSOCKET (always active)
 # =========================
 ws_restart = threading.Event()
 ws_restart.set()
@@ -604,6 +604,61 @@ def alert_loop():
 threading.Thread(target=alert_loop, daemon=True).start()
 
 # =========================
+# LIVE PRICE TICKER (ANIMATION)
+# =========================
+live_tickers = {}  # chat_id -> {"symbol": str, "message_id": int, "running": bool}
+
+@bot.message_handler(commands=["live"])
+def live_price_start(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /live BTC\nStop with /stop_live", back_button())
+        return
+    symbol = args[1].upper()
+    # Check if coin exists
+    price, _ = Binance.price(symbol)
+    if price is None:
+        send_and_track(m.chat.id, f"❌ Symbol {symbol} not found.", back_button())
+        return
+    # Stop any existing live ticker for this chat
+    if m.chat.id in live_tickers and live_tickers[m.chat.id].get("running"):
+        live_tickers[m.chat.id]["running"] = False
+        time.sleep(0.5)
+    # Send initial message
+    sent = send_and_track(m.chat.id, f"⏳ Live price for {symbol} – updates every 3 seconds. Send /stop_live to end.", None)
+    live_tickers[m.chat.id] = {"symbol": symbol, "message_id": sent.message_id, "running": True}
+    threading.Thread(target=_live_price_updater, args=(m.chat.id, symbol, sent.message_id), daemon=True).start()
+
+@bot.message_handler(commands=["stop_live"])
+def stop_live(m):
+    if m.chat.id in live_tickers and live_tickers[m.chat.id].get("running"):
+        live_tickers[m.chat.id]["running"] = False
+        send_and_track(m.chat.id, "⏹️ Live price updates stopped.", back_button())
+    else:
+        send_and_track(m.chat.id, "No active live price ticker.", back_button())
+
+def _live_price_updater(chat_id, symbol, msg_id):
+    step = 0
+    arrows = ["🟢▲", "🔴▼", "🟢▲", "🔴▼"]
+    while live_tickers.get(chat_id, {}).get("running", False):
+        price, change = Binance.price(symbol)
+        if price is None:
+            text = f"❌ Error fetching {symbol}"
+        else:
+            arrow = arrows[step % 4]
+            text = f"💵 <b>{symbol}</b>\n\n{fmt_price(price)}\n{arrow} {abs(change):.2f}%"
+        try:
+            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML")
+        except Exception as e:
+            log.warning(f"Live ticker edit error: {e}")
+        step += 1
+        time.sleep(3)
+    # Cleanup
+    live_tickers.pop(chat_id, None)
+
+# =========================
 # MESSAGE HISTORY
 # =========================
 msg_queue = {}
@@ -621,7 +676,7 @@ def send_and_track(chat_id, text, markup=None):
     return sent
 
 # =========================
-# UI / MENUS (updated text)
+# UI / MENUS
 # =========================
 def back_button():
     kb = InlineKeyboardMarkup()
@@ -1173,6 +1228,8 @@ def text_handler(message):
 # =========================
 def stop(sig, frame):
     ws_restart.set()
+    for data in live_tickers.values():
+        data["running"] = False
     try:
         bot.stop_polling()
     except:
@@ -1185,6 +1242,6 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started (UI: Coin info, Currencies, Back button, more currencies)")
+log.info("🚀 Persona Bot started (live price ticker added)")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
