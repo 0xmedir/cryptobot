@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final Production Version
-- Only /announce for mass messages (no duplicate /broadcast)
-- Multi‑currency supports search any coin
-- Maintenance mode, all critical fixes applied
+Persona Bot – Final Production Version (UI updates: Coin info, Currencies, Back)
 """
 
 import telebot
@@ -209,7 +206,11 @@ def fmt_price(p):
 def fmt_currency_value(currency_code, value):
     if value is None:
         return "N/A"
-    symbols = {"usd": "$", "eur": "€", "gbp": "£", "jpy": "¥", "cny": "¥", "aed": "د.إ", "try": "₺"}
+    symbols = {
+        "usd": "$", "eur": "€", "gbp": "£", "jpy": "¥",
+        "cny": "¥", "aed": "د.إ", "try": "₺",
+        "inr": "₹", "krw": "₩", "cad": "C$", "aud": "A$"
+    }
     symbol = symbols.get(currency_code, "")
     if currency_code == "aed":
         return f"{symbol} {value:,.2f}"
@@ -292,7 +293,7 @@ def is_admin(uid):
     return uid in ADMIN_IDS
 
 # =========================
-# SERVICES (Binance, CoinGecko, Scanner)
+# SERVICES
 # =========================
 class Binance:
     @staticmethod
@@ -421,7 +422,7 @@ class CoinGecko:
         try:
             r = session.get(
                 "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": coin_id, "vs_currencies": "usd,eur,gbp,jpy,cny,aed,try"},
+                params={"ids": coin_id, "vs_currencies": "usd,eur,gbp,jpy,cny,aed,try,inr,krw,cad,aud"},
                 timeout=10,
             )
             if r.status_code != 200:
@@ -516,7 +517,7 @@ def get_alert_count(user_id):
     return row[0] if row else 0
 
 # =========================
-# WEBSOCKET (always active)
+# WEBSOCKET
 # =========================
 ws_restart = threading.Event()
 ws_restart.set()
@@ -620,11 +621,11 @@ def send_and_track(chat_id, text, markup=None):
     return sent
 
 # =========================
-# UI / MENUS
+# UI / MENUS (updated text)
 # =========================
 def back_button():
     kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
 def coin_grid(prefix, coins):
@@ -644,7 +645,7 @@ def main_menu():
     kb = InlineKeyboardMarkup()
     kb.row(InlineKeyboardButton("💰 Price check", callback_data="menu_price"), InlineKeyboardButton("🔔 Alert traps", callback_data="menu_alerts"))
     kb.row(InlineKeyboardButton("🚀 Gainers", callback_data="gainers"), InlineKeyboardButton("📉 Losers", callback_data="losers"))
-    kb.row(InlineKeyboardButton("🔎 Coin intel", callback_data="menu_info"), InlineKeyboardButton("💱 Currency matrix", callback_data="menu_multi"))
+    kb.row(InlineKeyboardButton("🔎 Coin info", callback_data="menu_info"), InlineKeyboardButton("💱 Currencies", callback_data="menu_multi"))
     kb.row(InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"), InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"))
     kb.row(InlineKeyboardButton("👤 Profile", callback_data="profile"))
     return text, kb
@@ -653,21 +654,21 @@ def price_menu():
     text = "💵 <b>Price Check</b>\n\nTap a coin or type a ticker.\nExamples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>"
     kb = coin_grid("price", ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "MATIC"])
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_price"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def info_menu():
-    text = "🔎 <b>Coin Intel</b>\n\nPick a coin for rank, ATH/ATL, supply, market cap, and volume."
+    text = "🔎 <b>Coin Info</b>\n\nPick a coin for rank, ATH/ATL, supply, market cap, and volume."
     kb = coin_grid("info", ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "MATIC"])
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_info"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def multi_menu():
-    text = "💱 <b>Currency Matrix</b>\n\nSee a coin across multiple currencies."
+    text = "💱 <b>Currencies</b>\n\nSee a coin across multiple currencies."
     kb = coin_grid("multi", ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "MATIC"])
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def alerts_menu():
@@ -678,7 +679,7 @@ def alerts_menu():
     kb.row(InlineKeyboardButton("SOL > 200", callback_data="setalert_SOL_>_200"), InlineKeyboardButton("SOL < 100", callback_data="setalert_SOL_<_100"))
     kb.row(InlineKeyboardButton("✏️ Custom alert", callback_data="custom_alert"))
     kb.row(InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def scan_menu():
@@ -699,7 +700,7 @@ def cooldown_ok(uid):
     return True
 
 # =========================
-# ADMIN COMMANDS (including announce, no broadcast)
+# ADMIN COMMANDS
 # =========================
 @bot.message_handler(commands=["stats"])
 def stats_cmd(m):
@@ -835,7 +836,7 @@ def render_alert_list(chat_id):
         arrow = "▲" if a["direction"] == ">" else "▼"
         text += f"#{a['id']} <b>{h(a['coin'])}</b> {arrow} <b>${a['target']:,.2f}</b>\n"
         kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -882,7 +883,7 @@ def cb(call):
         elif data == "search_info":
             with wait_lock:
                 waiting[wait_key] = "info"
-            send_and_track(cid, "🔎 <b>Coin Intel Search</b>\n\nType any ticker to pull the full profile.", back_button())
+            send_and_track(cid, "🔎 <b>Coin Info Search</b>\n\nType any ticker to pull the full profile.", back_button())
 
         elif data == "menu_multi":
             with wait_lock:
@@ -893,7 +894,7 @@ def cb(call):
         elif data == "search_multi":
             with wait_lock:
                 waiting[wait_key] = "multi"
-            send_and_track(cid, "💱 <b>Currency Matrix Search</b>\n\nType any ticker.", back_button())
+            send_and_track(cid, "💱 <b>Currency Search</b>\n\nType any ticker.", back_button())
 
         elif data == "menu_scan":
             with wait_lock:
@@ -989,7 +990,7 @@ def cb(call):
             sym = data.split("_", 1)[1]
             info = CoinGecko.info(sym)
             if not info:
-                send_and_track(cid, f"🚫 No intel for <b>{h(sym)}</b>.", info_menu()[1])
+                send_and_track(cid, f"🚫 No info for <b>{h(sym)}</b>.", info_menu()[1])
             else:
                 max_supply = info["max_supply"] if info["max_supply"] else "∞"
                 text = (f"🔎 <b>{h(info['name'])} ({h(info['symbol'])})</b>\n\n"
@@ -1008,11 +1009,17 @@ def cb(call):
             if not prices:
                 send_and_track(cid, f"🚫 No data for <b>{h(sym)}</b>.", multi_menu()[1])
             else:
-                order = [("usd", "🇺🇸 USD"), ("eur", "🇪🇺 EUR"), ("gbp", "🇬🇧 GBP"), ("jpy", "🇯🇵 JPY"), ("cny", "🇨🇳 CNY"), ("aed", "🇦🇪 AED"), ("try", "🇹🇷 TRY")]
-                text = f"💱 <b>{h(sym)} — Currency Matrix</b>\n\n"
+                order = [
+                    ("usd", "🇺🇸 USD"), ("eur", "🇪🇺 EUR"), ("gbp", "🇬🇧 GBP"),
+                    ("jpy", "🇯🇵 JPY"), ("cny", "🇨🇳 CNY"), ("aed", "🇦🇪 AED"),
+                    ("try", "🇹🇷 TRY"), ("inr", "🇮🇳 INR"), ("krw", "🇰🇷 KRW"),
+                    ("cad", "🇨🇦 CAD"), ("aud", "🇦🇺 AUD")
+                ]
+                text = f"💱 <b>{h(sym)} — Currencies</b>\n\n"
                 for key, flag in order:
-                    if key in prices and prices[key] is not None:
-                        text += f"{flag}: <b>{h(fmt_currency_value(key, prices[key]))}</b>\n"
+                    val = prices.get(key)
+                    if val is not None:
+                        text += f"{flag}: <b>{h(fmt_currency_value(key, val))}</b>\n"
                 send_and_track(cid, text, multi_menu()[1])
 
         elif data == "profile":
@@ -1074,7 +1081,7 @@ def text_handler(message):
         elif mode == "info":
             info = CoinGecko.info(text.upper())
             if not info:
-                send_and_track(cid, f"🚫 No intel for <b>{h(text)}</b>.", info_menu()[1])
+                send_and_track(cid, f"🚫 No info for <b>{h(text)}</b>.", info_menu()[1])
             else:
                 max_supply = info["max_supply"] if info["max_supply"] else "∞"
                 out = (f"🔎 <b>{h(info['name'])} ({h(info['symbol'])})</b>\n\n"
@@ -1092,11 +1099,17 @@ def text_handler(message):
             if not prices:
                 send_and_track(cid, f"🚫 No data for <b>{h(text)}</b>.", multi_menu()[1])
             else:
-                order = [("usd", "🇺🇸 USD"), ("eur", "🇪🇺 EUR"), ("gbp", "🇬🇧 GBP"), ("jpy", "🇯🇵 JPY"), ("cny", "🇨🇳 CNY"), ("aed", "🇦🇪 AED"), ("try", "🇹🇷 TRY")]
-                out = f"💱 <b>{h(text.upper())} — Currency Matrix</b>\n\n"
+                order = [
+                    ("usd", "🇺🇸 USD"), ("eur", "🇪🇺 EUR"), ("gbp", "🇬🇧 GBP"),
+                    ("jpy", "🇯🇵 JPY"), ("cny", "🇨🇳 CNY"), ("aed", "🇦🇪 AED"),
+                    ("try", "🇹🇷 TRY"), ("inr", "🇮🇳 INR"), ("krw", "🇰🇷 KRW"),
+                    ("cad", "🇨🇦 CAD"), ("aud", "🇦🇺 AUD")
+                ]
+                out = f"💱 <b>{h(text.upper())} — Currencies</b>\n\n"
                 for key, flag in order:
-                    if key in prices and prices[key] is not None:
-                        out += f"{flag}: <b>{h(fmt_currency_value(key, prices[key]))}</b>\n"
+                    val = prices.get(key)
+                    if val is not None:
+                        out += f"{flag}: <b>{h(fmt_currency_value(key, val))}</b>\n"
                 send_and_track(cid, out, multi_menu()[1])
 
         elif mode == "scan":
@@ -1172,6 +1185,6 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started (only /announce, multi‑currency search works)")
+log.info("🚀 Persona Bot started (UI: Coin info, Currencies, Back button, more currencies)")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
