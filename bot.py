@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final Production Build
-Fixes from doc3 review:
-  1. Live ticker arrow uses actual change direction, not step-cycling
-  2. active_tickers keyed by (chat_id, user_id) — no group-chat collisions
-  3. Live ticker falls back to CoinGecko for non-Binance coins
-  4. ws_loop reverted replace() → removesuffix() (was lost in doc3)
-  5. Concurrent ticker cap (MAX_LIVE_TICKERS) to prevent thread flood
-  6. start_live_ticker uses threading.Event for clean stop, not sleep(0.3)
-  7. broadcast_all helper restored — /announce and /maintenance share it
-All previous fixes (1-10) remain intact.
+Persona Bot – Final Production Build (9‑coin grid, live ticker, maintenance)
 """
 
 import telebot
@@ -43,7 +34,7 @@ MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
 MAX_TEXT_LEN = 200
 MAX_HISTORY = 3
-MAX_LIVE_TICKERS = 50  # FIX 5: cap concurrent ticker threads
+MAX_LIVE_TICKERS = 50
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("PersonaBot")
@@ -181,7 +172,7 @@ retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503,
 adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
-session.headers.update({"User-Agent": "PersonaBot/15.0"})
+session.headers.update({"User-Agent": "PersonaBot/16.0"})
 
 # =========================
 # COINGECKO RATE LIMITER
@@ -234,6 +225,47 @@ def safe_first_200(text):
     return (text or "")[:200]
 
 # =========================
+# MAINTENANCE MODE
+# =========================
+def get_maintenance():
+    row = db_query("SELECT active, message FROM maintenance WHERE id=1", fetch_one=True)
+    if not row:
+        return False, ""
+    return bool(row[0]), row[1] or ""
+
+def set_maintenance(active, message=""):
+    db_query("UPDATE maintenance SET active=?, message=? WHERE id=1", (1 if active else 0, message))
+
+def maintenance_block(uid, cid):
+    if is_admin(uid):
+        return False
+    active, msg = get_maintenance()
+    if not active:
+        return False
+    bot.send_message(
+        cid,
+        "🔧 <b>Bot Under Maintenance</b>\n\n"
+        + (h(msg) if msg else "We'll be back shortly. Thank you for your patience."),
+        disable_web_page_preview=True,
+    )
+    return True
+
+def broadcast_all(text, skip_uid=None):
+    rows = db_query("SELECT DISTINCT user_id FROM profiles", fetch_all=True) or []
+    sent = failed = 0
+    for (uid,) in rows:
+        if skip_uid and uid == skip_uid:
+            continue
+        try:
+            bot.send_message(uid, text)
+            sent += 1
+            time.sleep(0.05)
+        except Exception as e:
+            log.error(f"broadcast_all failed for {uid}: {e}")
+            failed += 1
+    return sent, failed
+
+# =========================
 # PROFILES
 # =========================
 def get_profile(user_id):
@@ -270,48 +302,6 @@ def log_interaction(uid, uname, fname, cmd, det=""):
 
 def is_admin(uid):
     return uid in ADMIN_IDS
-
-# =========================
-# MAINTENANCE MODE
-# =========================
-def get_maintenance():
-    row = db_query("SELECT active, message FROM maintenance WHERE id=1", fetch_one=True)
-    if not row:
-        return False, ""
-    return bool(row[0]), row[1] or ""
-
-def set_maintenance(active, message=""):
-    db_query("UPDATE maintenance SET active=?, message=? WHERE id=1", (1 if active else 0, message))
-
-def maintenance_block(uid, cid):
-    if is_admin(uid):
-        return False
-    active, msg = get_maintenance()
-    if not active:
-        return False
-    bot.send_message(
-        cid,
-        "🔧 <b>Bot Under Maintenance</b>\n\n"
-        + (h(msg) if msg else "We'll be back shortly. Thank you for your patience."),
-        disable_web_page_preview=True,
-    )
-    return True
-
-# FIX 7: shared broadcast helper used by /announce and /maintenance
-def broadcast_all(text, skip_uid=None):
-    rows = db_query("SELECT DISTINCT user_id FROM profiles", fetch_all=True) or []
-    sent = failed = 0
-    for (uid,) in rows:
-        if skip_uid and uid == skip_uid:
-            continue
-        try:
-            bot.send_message(uid, text)
-            sent += 1
-            time.sleep(0.05)
-        except Exception as e:
-            log.error(f"broadcast_all failed for {uid}: {e}")
-            failed += 1
-    return sent, failed
 
 # =========================
 # SERVICES
@@ -366,7 +356,6 @@ class CoinGecko:
         "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
         "SOL": "solana", "XRP": "ripple", "DOGE": "dogecoin",
         "ADA": "cardano", "AVAX": "avalanche-2", "LINK": "chainlink",
-        "MATIC": "matic-network",
     }
 
     @staticmethod
@@ -557,7 +546,6 @@ def ws_loop():
                     if "data" not in d:
                         return
                     t = d["data"]
-                    # FIX 4: removesuffix instead of replace
                     symbol = t["s"].removesuffix("USDT")
                     price_cache.set(f"{symbol}_binance", float(t["c"]), ttl=3)
                 except (KeyError, ValueError, TypeError) as e:
@@ -628,22 +616,19 @@ threading.Thread(target=alert_loop, daemon=True).start()
 # =========================
 # LIVE TICKER MANAGER
 # =========================
-# FIX 2: keyed by (chat_id, user_id) — no group-chat collisions
 active_tickers = {}
 tickers_lock = threading.RLock()
 
 def start_live_ticker(chat_id, user_id, symbol, msg_id):
     key = (chat_id, user_id)
 
-    # FIX 5: enforce concurrent ticker cap
     with tickers_lock:
         if len(active_tickers) >= MAX_LIVE_TICKERS and key not in active_tickers:
             bot.send_message(chat_id, "🚫 Too many live tickers active. Try again shortly.")
             return
 
-        # FIX 6: signal old ticker to stop via Event, don't sleep-guess
         if key in active_tickers:
-            active_tickers[key].set()  # signal stop
+            active_tickers[key].set()
 
         stop_event = threading.Event()
         active_tickers[key] = stop_event
@@ -658,7 +643,6 @@ def _live_ticker_updater(chat_id, user_id, symbol, msg_id, stop_event):
     key = (chat_id, user_id)
     source_is_binance = True
 
-    # FIX 3: check if coin is on Binance; fall back to CoinGecko polling if not
     test_price, test_change = Binance.price(symbol)
     if test_price is None:
         source_is_binance = False
@@ -670,7 +654,6 @@ def _live_ticker_updater(chat_id, user_id, symbol, msg_id, stop_event):
             if source_is_binance:
                 price, change = Binance.price(symbol)
             else:
-                # FIX 3: CoinGecko fallback — poll every tick
                 info = CoinGecko.info(symbol)
                 price = info["price"] if info else None
                 change = None
@@ -678,7 +661,6 @@ def _live_ticker_updater(chat_id, user_id, symbol, msg_id, stop_event):
             if price is None:
                 text = f"❌ <b>{h(symbol)}</b> — price unavailable"
             else:
-                # FIX 1: arrow based on actual change, not step cycling
                 if change is not None:
                     arrow = "🟢▲" if change >= 0 else "🔴▼"
                     change_str = f"{arrow} {abs(change):.2f}%"
@@ -700,11 +682,10 @@ def _live_ticker_updater(chat_id, user_id, symbol, msg_id, stop_event):
 
         except Exception as e:
             log.warning(f"Live ticker edit failed ({key}): {e}")
-            break  # message deleted or bot blocked — clean up
+            break
 
         stop_event.wait(timeout=3)
 
-    # cleanup
     with tickers_lock:
         if active_tickers.get(key) is stop_event:
             del active_tickers[key]
@@ -728,7 +709,7 @@ def send_and_track(chat_id, text, markup=None):
     return sent
 
 # =========================
-# UI / MENUS
+# UI / MENUS (9‑coin grid, updated text)
 # =========================
 def back_button():
     kb = InlineKeyboardMarkup()
@@ -754,8 +735,8 @@ def main_menu():
            InlineKeyboardButton("🔔 Alert traps", callback_data="menu_alerts"))
     kb.row(InlineKeyboardButton("🚀 Gainers", callback_data="gainers"),
            InlineKeyboardButton("📉 Losers", callback_data="losers"))
-    kb.row(InlineKeyboardButton("🔎 Coin intel", callback_data="menu_info"),
-           InlineKeyboardButton("💱 Currency matrix", callback_data="menu_multi"))
+    kb.row(InlineKeyboardButton("🔎 Coin info", callback_data="menu_info"),
+           InlineKeyboardButton("💱 Currencies", callback_data="menu_multi"))
     kb.row(InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"),
            InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"))
     kb.row(InlineKeyboardButton("👤 Profile", callback_data="profile"))
@@ -763,21 +744,25 @@ def main_menu():
 
 def price_menu():
     text = "💵 <b>Price Check</b>\n\nTap a coin or type a ticker.\nExamples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>"
-    kb = coin_grid("price", ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "MATIC"])
+    # 9 coins – 3×3 grid
+    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
+    kb = coin_grid("price", coins)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_price"))
     kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
     return text, kb
 
 def info_menu():
-    text = "🔎 <b>Coin Intel</b>\n\nPick a coin for rank, ATH/ATL, supply, market cap, and volume."
-    kb = coin_grid("info", ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "MATIC"])
+    text = "🔎 <b>Coin Info</b>\n\nPick a coin for rank, ATH/ATL, supply, market cap, and volume."
+    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
+    kb = coin_grid("info", coins)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_info"))
     kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
     return text, kb
 
 def multi_menu():
-    text = "💱 <b>Currency Matrix</b>\n\nSee a coin across multiple currencies."
-    kb = coin_grid("multi", ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "MATIC"])
+    text = "💱 <b>Currencies</b>\n\nSee a coin across multiple currencies."
+    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "LINK"]  # 7 coins (will have a 3‑3‑1 layout, acceptable)
+    kb = coin_grid("multi", coins)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
     kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
     return text, kb
@@ -856,7 +841,6 @@ def users_cmd(m):
         lines.append(f"…and {total - 50} more")
     send_and_track(m.chat.id, "👥 <b>Users</b>\n\n" + "\n".join(lines), back_button())
 
-# FIX 7: /announce uses broadcast_all helper
 @bot.message_handler(commands=["announce"])
 def announce_cmd(m):
     if not is_admin(m.from_user.id):
@@ -876,7 +860,6 @@ def clear_alerts_cmd(m):
     rebuild_ws()
     send_and_track(m.chat.id, "✅ All active alerts have been cleared.", back_button())
 
-# FIX 7: /maintenance uses broadcast_all helper
 @bot.message_handler(commands=["maintenance"])
 def maintenance_cmd(m):
     if not is_admin(m.from_user.id):
@@ -1003,7 +986,7 @@ def cb(call):
         elif data == "search_info":
             with wait_lock:
                 waiting[wait_key] = "info"
-            send_and_track(cid, "🔎 <b>Coin Intel Search</b>\n\nType any ticker to pull the full profile.", back_button())
+            send_and_track(cid, "🔎 <b>Coin Info Search</b>\n\nType any ticker to pull the full profile.", back_button())
 
         elif data == "menu_multi":
             with wait_lock:
@@ -1014,7 +997,7 @@ def cb(call):
         elif data == "search_multi":
             with wait_lock:
                 waiting[wait_key] = "multi"
-            send_and_track(cid, "💱 <b>Currency Matrix Search</b>\n\nType any ticker.", back_button())
+            send_and_track(cid, "💱 <b>Currency Search</b>\n\nType any ticker.", back_button())
 
         elif data == "menu_scan":
             with wait_lock:
@@ -1105,7 +1088,7 @@ def cb(call):
             sym = data.split("_", 1)[1]
             info = CoinGecko.info(sym)
             if not info:
-                send_and_track(cid, f"🚫 No intel for <b>{h(sym)}</b>.", info_menu()[1])
+                send_and_track(cid, f"🚫 No info for <b>{h(sym)}</b>.", info_menu()[1])
             else:
                 max_supply = info["max_supply"] if info["max_supply"] else "∞"
                 text = (f"🔎 <b>{h(info['name'])} ({h(info['symbol'])})</b>\n\n"
@@ -1130,7 +1113,7 @@ def cb(call):
                     ("try", "🇹🇷 TRY"), ("inr", "🇮🇳 INR"), ("krw", "🇰🇷 KRW"),
                     ("cad", "🇨🇦 CAD"), ("aud", "🇦🇺 AUD"),
                 ]
-                text = f"💱 <b>{h(sym)} — Currency Matrix</b>\n\n"
+                text = f"💱 <b>{h(sym)} — Currencies</b>\n\n"
                 for key, flag in order:
                     val = prices.get(key)
                     if val is not None:
@@ -1192,7 +1175,7 @@ def text_handler(message):
         elif mode == "info":
             info = CoinGecko.info(text.upper())
             if not info:
-                send_and_track(cid, f"🚫 No intel for <b>{h(text)}</b>.", info_menu()[1])
+                send_and_track(cid, f"🚫 No info for <b>{h(text)}</b>.", info_menu()[1])
             else:
                 max_supply = info["max_supply"] if info["max_supply"] else "∞"
                 out = (f"🔎 <b>{h(info['name'])} ({h(info['symbol'])})</b>\n\n"
@@ -1216,7 +1199,7 @@ def text_handler(message):
                     ("try", "🇹🇷 TRY"), ("inr", "🇮🇳 INR"), ("krw", "🇰🇷 KRW"),
                     ("cad", "🇨🇦 CAD"), ("aud", "🇦🇺 AUD"),
                 ]
-                out = f"💱 <b>{h(text.upper())} — Currency Matrix</b>\n\n"
+                out = f"💱 <b>{h(text.upper())} — Currencies</b>\n\n"
                 for key, flag in order:
                     val = prices.get(key)
                     if val is not None:
@@ -1297,6 +1280,6 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started — final build (all fixes, live ticker, maintenance mode)")
+log.info("🚀 Persona Bot started – 9‑coin grid, live ticker, maintenance mode")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
