@@ -6,6 +6,13 @@ Persona Bot – Ultimate Edition (fully fixed)
 - All menu handlers implemented
 - WebSocket auto-reconnect
 - Admin commands
+
+FIXES APPLIED:
+  1. text_handler now skips commands so /price /info /live /scan /start /help work
+  2. scan_command correctly reads GoPlusLabs top-level risk fields
+  3. init_db() migration changes are committed immediately
+  4. alert_command now opens the alerts menu instead of referencing /custom_alert
+  5. /price /info /live /scan all check maintenance_block()
 """
 
 import telebot
@@ -86,6 +93,7 @@ def db_query(query, params=(), fetch_one=False, fetch_all=False, retries=3):
             raise
     return None
 
+# ── FIX #3: commit after each migration step so changes survive a crash ─────
 def init_db():
     try:
         cur = conn.cursor()
@@ -96,10 +104,12 @@ def init_db():
             if "streak" in columns:
                 log.info("Old profiles schema detected. Dropping and recreating.")
                 conn.execute("DROP TABLE profiles")
+                conn.commit()                          # ← FIX #3
             elif "username" not in columns:
                 log.info("Adding username and first_name columns to profiles.")
                 conn.execute("ALTER TABLE profiles ADD COLUMN username TEXT")
                 conn.execute("ALTER TABLE profiles ADD COLUMN first_name TEXT")
+                conn.commit()                          # ← FIX #3
     except Exception as e:
         log.error(f"Migration check error: {e}")
 
@@ -173,7 +183,7 @@ class TTLCache:
 
 price_cache = TTLCache(3)
 coin_cache = TTLCache(3600)
-multi_cache = TTLCache(10)          # for multi-currency responses
+multi_cache = TTLCache(10)
 
 # =========================
 # REQUEST SESSION
@@ -433,7 +443,6 @@ class CoinGecko:
 
     @staticmethod
     def multi_price(symbol):
-        # check cache first
         cached = multi_cache.get(f"multi_{symbol}")
         if cached:
             return cached
@@ -510,7 +519,6 @@ class ContractScanner:
 # ALERTS
 # =========================
 def add_alert(user_id, chat_id, coin, target, direction):
-    # enforce limit
     current = get_alert_count(user_id)
     if current >= MAX_ALERTS_PER_USER:
         return None, f"❌ You already have {current} active alerts (max {MAX_ALERTS_PER_USER})."
@@ -576,7 +584,6 @@ def ws_loop():
                     log.warning(f"WS on_message error: {e}")
             def on_error(_ws, err):
                 log.warning(f"WS error: {err}")
-                # force reconnect
                 rebuild_ws()
             def on_close(_ws, close_status_code, close_msg):
                 log.info("WS closed, will reconnect")
@@ -816,7 +823,6 @@ def wallet_cmd(m):
     address = args[1].strip()
     try:
         if address.startswith("0x") and len(address) == 42:
-            # EVM using Etherscan V2
             url = f"https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address={address}&tag=latest&apikey={ETHERSCAN_API_KEY}"
             r = session.get(url, timeout=10)
             if r.status_code != 200:
@@ -831,7 +837,6 @@ def wallet_cmd(m):
             text = f"🏦 <b>EVM Wallet</b>\n\nAddress: <code>{address}</code>\nBalance: <b>{balance_eth:.6f} ETH</b>"
             send_and_track(m.chat.id, text, back_button())
         elif len(address) >= 32 and len(address) <= 44 and re.match(r'^[A-Za-z0-9]+$', address):
-            # Solana – public RPC
             url = f"https://public-api.solscan.io/account/{address}"
             r = session.get(url, timeout=10)
             if r.status_code != 200:
@@ -893,6 +898,133 @@ def stats_cmd(m):
     total_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
     total_triggers = db_query("SELECT SUM(alerts_triggered) FROM profiles", fetch_one=True)[0] or 0
     bot.reply_to(m, f"📊 <b>Bot Stats</b>\n\nUsers: {total_users}\nActive alerts: {total_alerts}\nTotal triggers: {total_triggers}", parse_mode="HTML")
+
+# =========================
+# COMMAND HANDLERS
+# =========================
+@bot.message_handler(commands=["start", "help"])
+def start(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
+    log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
+    text, kb = main_menu()
+    send_and_track(m.chat.id, text, kb)
+
+@bot.message_handler(commands=["price"])
+def price_command(m):
+    if maintenance_block(m.from_user.id, m.chat.id):      # ← FIX #5
+        return
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /price <symbol>", back_button())
+        return
+    symbol = args[1].upper()
+    price, change, src = live_price(symbol)
+    if price is None:
+        text = f"❌ Could not fetch price for {symbol}"
+    else:
+        change_str = f" ({change:+.2f}%)" if change is not None else ""
+        text = f"💰 <b>{symbol}</b>\n{fmt_price(price)}{change_str}\n<i>Source: {src}</i>"
+    send_and_track(m.chat.id, text, back_button())
+
+@bot.message_handler(commands=["info"])
+def info_command(m):
+    if maintenance_block(m.from_user.id, m.chat.id):      # ← FIX #5
+        return
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /info <symbol>", back_button())
+        return
+    symbol = args[1].upper()
+    info = CoinGecko.info(symbol)
+    if not info:
+        text = f"❌ No info found for {symbol}"
+    else:
+        text = (
+            f"🔎 <b>{info['name']} ({info['symbol']})</b>\n\n"
+            f"📊 Rank: #{info['rank']}\n"
+            f"💰 Price: {fmt_price(info['price'])}\n"
+            f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+            f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+            f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
+            f"📊 24h Volume: {fmt_price(info['volume'])}\n"
+            f"🔄 Circulating Supply: {info['supply']:,.0f}\n"
+        )
+        if info['max_supply']:
+            text += f"🔝 Max Supply: {info['max_supply']:,.0f}"
+    send_and_track(m.chat.id, text, back_button())
+
+@bot.message_handler(commands=["live"])
+def live_command(m):
+    if maintenance_block(m.from_user.id, m.chat.id):      # ← FIX #5
+        return
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /live <symbol>", back_button())
+        return
+    symbol = args[1].upper()
+    start_ticker(m.chat.id, symbol)
+
+# ── FIX #4: /alert now opens the alerts menu ────────────────────────────────
+@bot.message_handler(commands=["alert"])
+def alert_command(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
+    text, kb = alerts_menu()
+    send_and_track(m.chat.id, text, kb)
+
+@bot.message_handler(commands=["scan"])
+def scan_command(m):
+    if maintenance_block(m.from_user.id, m.chat.id):      # ← FIX #5
+        return
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /scan <contract_address>", back_button())
+        return
+    address = args[1]
+    result, err = ContractScanner.scan(address)
+    if err:
+        send_and_track(m.chat.id, f"❌ {err}", back_button())
+        return
+
+    # ── FIX #2: read actual GoPlusLabs top-level fields ─────────────────────
+    text = "🛡 <b>Contract Security</b>\n\n"
+    text += f"<code>{address[:20]}...{address[-10:]}</code>\n\n"
+
+    RISK_FLAGS = {
+        "is_honeypot":    ("🍯 Honeypot",          "1"),
+        "is_mintable":    ("🖨 Mintable",           "1"),
+        "is_proxy":       ("🔀 Proxy contract",     "1"),
+        "is_blacklisted": ("⛔ Blacklist",          "1"),
+        "is_open_source": ("📄 Not open source",    "0"),   # "0" = bad
+    }
+    NUMERIC_FLAGS = {
+        "buy_tax":  "🛒 Buy tax",
+        "sell_tax": "💸 Sell tax",
+    }
+
+    flagged = []
+    for field, (label, bad_val) in RISK_FLAGS.items():
+        val = str(result.get(field, ""))
+        if val == bad_val:
+            flagged.append(f"⚠️ {label}: YES")
+
+    for field, label in NUMERIC_FLAGS.items():
+        val = result.get(field)
+        try:
+            pct = float(val) * 100
+            if pct > 0:
+                flagged.append(f"⚠️ {label}: {pct:.1f}%")
+        except (TypeError, ValueError):
+            pass
+
+    if flagged:
+        text += "<b>Risk flags:</b>\n" + "\n".join(flagged) + "\n"
+    else:
+        text += "✅ No high-risk flags detected.\n"
+
+    text += f"\n🔗 <a href='https://gopluslabs.io/'>GoPlusLabs</a>"
+    send_and_track(m.chat.id, text, back_button())
 
 # =========================
 # UI / MENUS
@@ -982,7 +1114,7 @@ def coin_grid(prefix, coins):
     return kb
 
 # =========================
-# CALLBACK HANDLERS (all implemented)
+# CALLBACK HANDLERS
 # =========================
 waiting = {}
 wait_lock = threading.RLock()
@@ -1084,7 +1216,6 @@ def info_cb(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("setalert_"))
 def set_alert_preset_cb(call):
-    # format: setalert_BTC_>_100000
     parts = call.data.split("_")
     if len(parts) < 4:
         bot.answer_callback_query(call.id, "Invalid alert format")
@@ -1199,10 +1330,9 @@ def multi_live_cb(call):
         threading.Thread(target=_live_multi_worker, args=(cid, symbol, sent.message_id), daemon=True).start()
         bot.answer_callback_query(call.id, f"Live multi‑currency for {symbol} started")
 
-# Search callbacks
 @bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
 def search_cb(call):
-    mode = call.data.split("_", 1)[1]  # price, info, multi
+    mode = call.data.split("_", 1)[1]
     cid = call.message.chat.id
     uid = call.from_user.id
     with wait_lock:
@@ -1211,23 +1341,27 @@ def search_cb(call):
     bot.answer_callback_query(call.id)
 
 # =========================
-# TEXT HANDLERS (custom alert, search)
+# TEXT HANDLER (catch-all)
+# ── FIX #1: skip commands so all registered command handlers work ────────────
 # =========================
 @bot.message_handler(func=lambda m: True)
 def text_handler(m):
+    # If it's a command, let the dedicated command handlers deal with it
+    if m.text and m.text.startswith("/"):
+        return
+
     cid = m.chat.id
     uid = m.from_user.id
     with wait_lock:
         state = waiting.pop((cid, uid), None)
     if not state:
-        return  # ignore any other text
+        return  # ignore plain text with no active state
 
     if m.text.lower() == "/cancel":
         send_and_track(cid, "❌ Cancelled.", back_button())
         return
 
     if state == "custom_alert":
-        # parse "COIN > 123" or "COIN < 123"
         pattern = r"^(\w+)\s*([<>])\s*([\d.]+)$"
         match = re.match(pattern, m.text.strip().upper())
         if not match:
@@ -1280,7 +1414,6 @@ def text_handler(m):
         return
 
 def start_live_multi(chat_id, symbol):
-    # same as multi_live callback but without callback
     with multi_tickers_lock:
         if chat_id in multi_tickers and multi_tickers[chat_id].get("running", False):
             multi_tickers[chat_id]["running"] = False
@@ -1290,99 +1423,6 @@ def start_live_multi(chat_id, symbol):
         sent = send_and_track(chat_id, text, back_button())
         multi_tickers[chat_id] = {"symbol": symbol, "message_id": sent.message_id, "running": True}
         threading.Thread(target=_live_multi_worker, args=(chat_id, symbol, sent.message_id), daemon=True).start()
-
-# =========================
-# COMMAND HANDLERS (additional)
-# =========================
-@bot.message_handler(commands=["price"])
-def price_command(m):
-    args = m.text.split()
-    if len(args) < 2:
-        send_and_track(m.chat.id, "Usage: /price <symbol>", back_button())
-        return
-    symbol = args[1].upper()
-    price, change, src = live_price(symbol)
-    if price is None:
-        text = f"❌ Could not fetch price for {symbol}"
-    else:
-        change_str = f" ({change:+.2f}%)" if change is not None else ""
-        text = f"💰 <b>{symbol}</b>\n{fmt_price(price)}{change_str}\n<i>Source: {src}</i>"
-    send_and_track(m.chat.id, text, back_button())
-
-@bot.message_handler(commands=["info"])
-def info_command(m):
-    args = m.text.split()
-    if len(args) < 2:
-        send_and_track(m.chat.id, "Usage: /info <symbol>", back_button())
-        return
-    symbol = args[1].upper()
-    info = CoinGecko.info(symbol)
-    if not info:
-        text = f"❌ No info found for {symbol}"
-    else:
-        text = (
-            f"🔎 <b>{info['name']} ({info['symbol']})</b>\n\n"
-            f"📊 Rank: #{info['rank']}\n"
-            f"💰 Price: {fmt_price(info['price'])}\n"
-            f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
-            f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
-            f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
-            f"📊 24h Volume: {fmt_price(info['volume'])}\n"
-            f"🔄 Circulating Supply: {info['supply']:,.0f}\n"
-        )
-        if info['max_supply']:
-            text += f"🔝 Max Supply: {info['max_supply']:,.0f}"
-    send_and_track(m.chat.id, text, back_button())
-
-@bot.message_handler(commands=["live"])
-def live_command(m):
-    args = m.text.split()
-    if len(args) < 2:
-        send_and_track(m.chat.id, "Usage: /live <symbol>", back_button())
-        return
-    symbol = args[1].upper()
-    start_ticker(m.chat.id, symbol)
-
-@bot.message_handler(commands=["alert"])
-def alert_command(m):
-    # same as custom alert but via command
-    send_and_track(m.chat.id, "Use the menu to set alerts, or type /cancel then use /custom_alert", back_button())
-
-@bot.message_handler(commands=["scan"])
-def scan_command(m):
-    args = m.text.split()
-    if len(args) < 2:
-        send_and_track(m.chat.id, "Usage: /scan <contract_address>", back_button())
-        return
-    address = args[1]
-    result, err = ContractScanner.scan(address)
-    if err:
-        send_and_track(m.chat.id, f"❌ {err}", back_button())
-        return
-    # format result nicely
-    text = "🛡 <b>Contract Security</b>\n\n"
-    text += f"<code>{address[:20]}...{address[-10:]}</code>\n\n"
-    risk = result.get('risk', {})
-    if risk:
-        text += "⚠️ <b>Risks:</b>\n"
-        for k, v in risk.items():
-            if v:
-                text += f"• {k}: {v}\n"
-    else:
-        text += "✅ No high-risk flags found.\n"
-    text += f"\n🔗 <a href='https://gopluslabs.io/'>GoPlusLabs</a>"
-    send_and_track(m.chat.id, text, back_button())
-
-# =========================
-# START
-# =========================
-@bot.message_handler(commands=["start", "help"])
-def start(m):
-    if maintenance_block(m.from_user.id, m.chat.id):
-        return
-    log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
-    text, kb = main_menu()
-    send_and_track(m.chat.id, text, kb)
 
 # =========================
 # SHUTDOWN
