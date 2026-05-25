@@ -6,14 +6,9 @@ Persona Bot – Ultimate Edition (fully fixed)
 - All menu handlers implemented
 - WebSocket auto-reconnect
 - Admin commands
-
-FIXES APPLIED:
-  1. text_handler now skips commands so /price /info /live /scan /start /help work
-  2. scan_command correctly reads GoPlusLabs top-level risk fields
-  3. init_db() migration changes are committed immediately
-  4. alert_command now opens the alerts menu instead of referencing /custom_alert
-  5. /price /info /live /scan all check maintenance_block()
-  6. Wallet checker feature removed completely
+- Price menu: every coin starts a live ticker
+- Gainers/Losers: Top 10 live & static
+- Currencies: live multi-currency ticker
 """
 
 import telebot
@@ -1005,7 +1000,7 @@ def gainers_losers_menu():
     return text, kb
 
 def price_menu():
-    text = "💵 <b>Price Check</b>\n\nTap a coin or type a ticker.\nExamples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>"
+    text = "💵 <b>Price Check</b>\n\nTap a coin to start a <b>live ticker</b> (updates every 3s).\nExamples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>"
     coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
     kb = coin_grid("price", coins)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_price"))
@@ -1133,16 +1128,11 @@ def profile_cb(call):
     send_and_track(call.message.chat.id, text, back_button())
     bot.answer_callback_query(call.id)
 
+# ---------- MODIFIED: Price button starts live ticker ----------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def price_cb(call):
     symbol = call.data.split("_", 1)[1]
-    price, change, src = live_price(symbol)
-    if price is None:
-        text = f"❌ Could not fetch price for {symbol}"
-    else:
-        change_str = f" ({change:+.2f}%)" if change is not None else ""
-        text = f"💰 <b>{symbol}</b>\n{fmt_price(price)}{change_str}\n<i>Source: {src}</i>"
-    send_and_track(call.message.chat.id, text, back_button())
+    start_ticker(call.message.chat.id, symbol)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
@@ -1334,13 +1324,9 @@ def text_handler(m):
         mode = state.split("_", 1)[1]
         symbol = m.text.strip().upper()
         if mode == "price":
-            price, change, src = live_price(symbol)
-            if price is None:
-                text = f"❌ Could not fetch price for {symbol}"
-            else:
-                change_str = f" ({change:+.2f}%)" if change is not None else ""
-                text = f"💰 <b>{symbol}</b>\n{fmt_price(price)}{change_str}\n<i>Source: {src}</i>"
-            send_and_track(cid, text, back_button())
+            # Search price now starts a live ticker as well
+            start_ticker(cid, symbol)
+            send_and_track(cid, f"⏳ Starting live ticker for {symbol}...", back_button())
         elif mode == "info":
             info = CoinGecko.info(symbol)
             if not info:
@@ -1401,7 +1387,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – Ultimate Edition (wallet checker removed)")
+log.info("🚀 Persona Bot started – Ultimate Edition (live price update for every coin)")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
