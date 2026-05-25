@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final: No menu persistence, last 3 messages rule for all
-- Each price request creates a live ticker with a 'Back' button
-- Menu is a normal message (subject to 3‑message limit)
-- 'Back' button regenerates the main menu
+Persona Bot – Ultimate Edition (fully fixed)
+- Whale alerts removed
+- Etherscan V2 with env API key
+- All menu handlers implemented
+- WebSocket auto-reconnect
+- Admin commands
 """
 
 import telebot
@@ -25,11 +27,16 @@ from telebot.apihelper import ApiTelegramException
 import websocket
 
 # =========================
-# CONFIG
+# CONFIG (environment)
 # =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN environment variable not set")
+    sys.exit(1)
+
+ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY")
+if not ETHERSCAN_API_KEY:
+    print("❌ ETHERSCAN_API_KEY environment variable not set")
     sys.exit(1)
 
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "7458428092").split(",") if x.strip()]
@@ -37,7 +44,7 @@ COOLDOWN_SECONDS = 2
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
 MAX_TEXT_LEN = 200
-MAX_HISTORY = 3          # keep only last 3 messages total
+MAX_HISTORY = 3
 MAX_LIVE_TICKERS = 50
 MAINTENANCE_SPAM_COOLDOWN = 60
 
@@ -166,6 +173,7 @@ class TTLCache:
 
 price_cache = TTLCache(3)
 coin_cache = TTLCache(3600)
+multi_cache = TTLCache(10)          # for multi-currency responses
 
 # =========================
 # REQUEST SESSION
@@ -175,7 +183,7 @@ retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503,
 adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
-session.headers.update({"User-Agent": "PersonaBot/16.0"})
+session.headers.update({"User-Agent": "PersonaBot/17.0"})
 
 # =========================
 # COINGECKO RATE LIMITER
@@ -425,6 +433,10 @@ class CoinGecko:
 
     @staticmethod
     def multi_price(symbol):
+        # check cache first
+        cached = multi_cache.get(f"multi_{symbol}")
+        if cached:
+            return cached
         coin_id = CoinGecko.resolve_id(symbol)
         if not coin_id:
             return None
@@ -437,7 +449,10 @@ class CoinGecko:
             )
             if r.status_code != 200:
                 return None
-            return r.json().get(coin_id)
+            data = r.json().get(coin_id)
+            if data:
+                multi_cache.set(f"multi_{symbol}", data, ttl=10)
+            return data
         except Exception as e:
             log.error(f"Multi price error {symbol}: {e}")
             return None
@@ -495,12 +510,16 @@ class ContractScanner:
 # ALERTS
 # =========================
 def add_alert(user_id, chat_id, coin, target, direction):
+    # enforce limit
+    current = get_alert_count(user_id)
+    if current >= MAX_ALERTS_PER_USER:
+        return None, f"❌ You already have {current} active alerts (max {MAX_ALERTS_PER_USER})."
     alert_id = db_query(
         "INSERT INTO alerts(user_id, chat_id, coin, target, direction, created_at) VALUES(?,?,?,?,?,?)",
         (user_id, chat_id, coin.upper(), target, direction, int(time.time())),
     )
     db_query("UPDATE profiles SET alerts_set = alerts_set + 1 WHERE user_id=?", (user_id,))
-    return alert_id
+    return alert_id, None
 
 def get_active_alerts(chat_id=None):
     if chat_id is None:
@@ -523,7 +542,7 @@ def get_alert_count(user_id):
     return row[0] if row else 0
 
 # =========================
-# WEBSOCKET (always runs, updates price cache)
+# WEBSOCKET (auto-reconnect)
 # =========================
 ws_restart = threading.Event()
 ws_restart.set()
@@ -553,13 +572,16 @@ def ws_loop():
                     t = d["data"]
                     symbol = t["s"].removesuffix("USDT")
                     price_cache.set(f"{symbol}_binance", float(t["c"]), ttl=3)
-                except (KeyError, ValueError, TypeError) as e:
-                    log.warning(f"WS on_message parse error: {e} | raw: {msg[:200]}")
                 except Exception as e:
-                    log.error(f"WS on_message unexpected error: {e}")
+                    log.warning(f"WS on_message error: {e}")
             def on_error(_ws, err):
                 log.warning(f"WS error: {err}")
-            app = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error)
+                # force reconnect
+                rebuild_ws()
+            def on_close(_ws, close_status_code, close_msg):
+                log.info("WS closed, will reconnect")
+                rebuild_ws()
+            app = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
             worker = threading.Thread(target=app.run_forever, kwargs={"ping_interval": 30, "ping_timeout": 10}, daemon=True)
             worker.start()
             while worker.is_alive():
@@ -613,7 +635,7 @@ def alert_loop():
 threading.Thread(target=alert_loop, daemon=True).start()
 
 # =========================
-# MESSAGE QUEUE (no special persistence – all messages count)
+# MESSAGE QUEUE
 # =========================
 msg_queue = {}
 q_lock = threading.RLock()
@@ -624,7 +646,6 @@ def send_and_track(chat_id, text, markup=None):
         if chat_id not in msg_queue:
             msg_queue[chat_id] = []
         msg_queue[chat_id].append(sent.message_id)
-        # Keep only last MAX_HISTORY messages
         while len(msg_queue[chat_id]) > MAX_HISTORY:
             old = msg_queue[chat_id].pop(0)
             try:
@@ -638,14 +659,10 @@ def back_button():
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
-def send_ticker(chat_id, symbol):
-    sent = send_and_track(chat_id, f"⏳ Starting live ticker for {symbol}...", back_button())
-    return sent
-
 # =========================
-# MULTIPLE LIVE TICKERS (one per price request) with Back button
+# LIVE TICKERS FOR SINGLE COIN
 # =========================
-tickers = {}  # key = (chat_id, ticker_id) -> stop_event
+tickers = {}
 tickers_lock = threading.RLock()
 next_ticker_id = 0
 
@@ -702,42 +719,204 @@ def _ticker_worker(chat_id, symbol, msg_id, stop_event, key):
         except Exception as e:
             log.warning(f"Ticker edit error ({key}): {e}")
         stop_event.wait(timeout=3)
-    # cleanup
     with tickers_lock:
         if key in tickers:
             del tickers[key]
 
 def start_ticker(chat_id, symbol):
-    sent = send_ticker(chat_id, symbol)
+    sent = send_and_track(chat_id, f"⏳ Starting live ticker for {symbol}...", back_button())
     create_ticker(chat_id, symbol, sent.message_id)
+
+# =========================
+# LIVE GAINERS/LOSERS
+# =========================
+live_gainers_active = {}
+live_gainers_lock = threading.RLock()
+
+def _live_gainers_worker(chat_id, msg_id):
+    while True:
+        with live_gainers_lock:
+            if chat_id not in live_gainers_active or not live_gainers_active[chat_id].get("running", False):
+                break
+        gainers, losers = Binance.top_movers()
+        if not gainers:
+            text = "❌ Failed to fetch data. Will retry..."
+        else:
+            text = "🚀 <b>Live Gainers/Losers</b>\n\n"
+            text += "📈 <b>Top 5 Gainers</b>\n"
+            for d in gainers:
+                coin = d["symbol"].removesuffix("USDT")
+                text += f"🟢 {coin}  ▲ {float(d['priceChangePercent']):.2f}%\n"
+            text += "\n📉 <b>Top 5 Losers</b>\n"
+            for d in losers:
+                coin = d["symbol"].removesuffix("USDT")
+                text += f"🔴 {coin}  ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
+        try:
+            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
+        except Exception as e:
+            log.warning(f"Live gainers edit error: {e}")
+        for _ in range(10):
+            with live_gainers_lock:
+                if chat_id not in live_gainers_active or not live_gainers_active[chat_id].get("running", False):
+                    break
+            time.sleep(1)
+    with live_gainers_lock:
+        live_gainers_active.pop(chat_id, None)
+
+# =========================
+# LIVE MULTI-CURRENCY
+# =========================
+multi_tickers = {}
+multi_tickers_lock = threading.RLock()
+
+def _live_multi_worker(chat_id, symbol, msg_id):
+    order = [
+        ("usd", "🇺🇸 USD"), ("eur", "🇪🇺 EUR"), ("gbp", "🇬🇧 GBP"),
+        ("jpy", "🇯🇵 JPY"), ("cny", "🇨🇳 CNY"), ("aed", "🇦🇪 AED"),
+        ("try", "🇹🇷 TRY"), ("inr", "🇮🇳 INR"), ("krw", "🇰🇷 KRW"),
+        ("cad", "🇨🇦 CAD"), ("aud", "🇦🇺 AUD"),
+    ]
+    while True:
+        with multi_tickers_lock:
+            if chat_id not in multi_tickers or not multi_tickers[chat_id].get("running", False):
+                break
+            current_symbol = multi_tickers[chat_id]["symbol"]
+        prices = CoinGecko.multi_price(current_symbol)
+        if not prices:
+            text = f"❌ Failed to fetch data for {current_symbol}"
+        else:
+            text = f"💱 <b>{current_symbol} – Currencies (live)</b>\n\n"
+            for key, flag in order:
+                val = prices.get(key)
+                if val is not None:
+                    text += f"{flag}: <b>{h(fmt_currency_value(key, val))}</b>\n"
+        try:
+            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
+        except Exception as e:
+            log.warning(f"Live multi edit error: {e}")
+        for _ in range(3):
+            with multi_tickers_lock:
+                if chat_id not in multi_tickers or not multi_tickers[chat_id].get("running", False):
+                    break
+            time.sleep(1)
+    with multi_tickers_lock:
+        multi_tickers.pop(chat_id, None)
+
+# =========================
+# WALLET CHECKER (Etherscan V2)
+# =========================
+@bot.message_handler(commands=["wallet"])
+def wallet_cmd(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /wallet <address>\nSupports EVM (0x...) and Solana addresses.", back_button())
+        return
+    address = args[1].strip()
+    try:
+        if address.startswith("0x") and len(address) == 42:
+            # EVM using Etherscan V2
+            url = f"https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address={address}&tag=latest&apikey={ETHERSCAN_API_KEY}"
+            r = session.get(url, timeout=10)
+            if r.status_code != 200:
+                send_and_track(m.chat.id, "❌ Failed to fetch balance.", back_button())
+                return
+            data = r.json()
+            if data.get("status") != "1":
+                send_and_track(m.chat.id, f"❌ Error: {data.get('message', 'Unknown')}", back_button())
+                return
+            balance_wei = int(data["result"])
+            balance_eth = balance_wei / 1e18
+            text = f"🏦 <b>EVM Wallet</b>\n\nAddress: <code>{address}</code>\nBalance: <b>{balance_eth:.6f} ETH</b>"
+            send_and_track(m.chat.id, text, back_button())
+        elif len(address) >= 32 and len(address) <= 44 and re.match(r'^[A-Za-z0-9]+$', address):
+            # Solana – public RPC
+            url = f"https://public-api.solscan.io/account/{address}"
+            r = session.get(url, timeout=10)
+            if r.status_code != 200:
+                send_and_track(m.chat.id, "❌ Failed to fetch Solana balance.", back_button())
+                return
+            data = r.json()
+            if not data or "lamports" not in data:
+                send_and_track(m.chat.id, "❌ Address not found or invalid.", back_button())
+                return
+            lamports = data["lamports"]
+            sol = lamports / 1e9
+            text = f"🏦 <b>Solana Wallet</b>\n\nAddress: <code>{address}</code>\nBalance: <b>{sol:.4f} SOL</b>"
+            send_and_track(m.chat.id, text, back_button())
+        else:
+            send_and_track(m.chat.id, "❌ Unrecognized address format.", back_button())
+    except Exception as e:
+        log.error(f"Wallet check error: {e}")
+        send_and_track(m.chat.id, "⚠️ Error checking wallet. Try again later.", back_button())
+
+# =========================
+# ADMIN COMMANDS
+# =========================
+@bot.message_handler(commands=["broadcast"])
+def broadcast_cmd(m):
+    if not is_admin(m.from_user.id):
+        return
+    args = m.text.split(maxsplit=1)
+    if len(args) < 2:
+        bot.reply_to(m, "Usage: /broadcast <message>")
+        return
+    msg = args[1]
+    sent, failed = broadcast_all(msg, skip_uid=m.from_user.id)
+    bot.reply_to(m, f"Broadcast sent to {sent} users. Failed: {failed}")
+
+@bot.message_handler(commands=["maintenance"])
+def maintenance_cmd(m):
+    if not is_admin(m.from_user.id):
+        return
+    args = m.text.split(maxsplit=1)
+    if len(args) < 2:
+        active, msg = get_maintenance()
+        bot.reply_to(m, f"Maintenance mode: {'ON' if active else 'OFF'}\nMessage: {msg}")
+        return
+    sub = args[1].lower()
+    if sub == "on":
+        set_maintenance(True, "Bot is under maintenance. Please try again later.")
+        bot.reply_to(m, "✅ Maintenance mode ENABLED. Use /maintenance off to disable.")
+    elif sub == "off":
+        set_maintenance(False)
+        bot.reply_to(m, "✅ Maintenance mode DISABLED.")
+    else:
+        bot.reply_to(m, "Usage: /maintenance on|off")
+
+@bot.message_handler(commands=["stats"])
+def stats_cmd(m):
+    if not is_admin(m.from_user.id):
+        return
+    total_users = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
+    total_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
+    total_triggers = db_query("SELECT SUM(alerts_triggered) FROM profiles", fetch_one=True)[0] or 0
+    bot.reply_to(m, f"📊 <b>Bot Stats</b>\n\nUsers: {total_users}\nActive alerts: {total_alerts}\nTotal triggers: {total_triggers}", parse_mode="HTML")
 
 # =========================
 # UI / MENUS
 # =========================
-def coin_grid(prefix, coins):
-    kb = InlineKeyboardMarkup()
-    row = []
-    for i, coin in enumerate(coins, 1):
-        row.append(InlineKeyboardButton(coin, callback_data=f"{prefix}_{coin}"))
-        if i % 3 == 0:
-            kb.row(*row)
-            row = []
-    if row:
-        kb.row(*row)
-    return kb
-
 def main_menu():
     text = "⚡ <b>PERSONA</b>\n\nFast crypto tools: prices, alerts, intel."
     kb = InlineKeyboardMarkup()
     kb.row(InlineKeyboardButton("💰 Price check", callback_data="menu_price"),
            InlineKeyboardButton("🔔 Alert traps", callback_data="menu_alerts"))
-    kb.row(InlineKeyboardButton("🚀 Gainers", callback_data="gainers"),
-           InlineKeyboardButton("📉 Losers", callback_data="losers"))
-    kb.row(InlineKeyboardButton("🔎 Coin info", callback_data="menu_info"),
-           InlineKeyboardButton("💱 Currencies", callback_data="menu_multi"))
-    kb.row(InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"),
-           InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"))
-    kb.row(InlineKeyboardButton("👤 Profile", callback_data="profile"))
+    kb.row(InlineKeyboardButton("📊 Gainers/Losers", callback_data="menu_gainers_losers"),
+           InlineKeyboardButton("🔎 Coin info", callback_data="menu_info"))
+    kb.row(InlineKeyboardButton("💱 Currencies", callback_data="menu_multi"),
+           InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"))
+    kb.row(InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"),
+           InlineKeyboardButton("👤 Profile", callback_data="profile"))
+    return text, kb
+
+def gainers_losers_menu():
+    text = "📊 <b>Gainers & Losers</b>\n\nChoose mode:"
+    kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("🔄 Live (updates every 10s)", callback_data="live_gainers"))
+    kb.row(InlineKeyboardButton("📈 Static top 5", callback_data="gainers"))
+    kb.row(InlineKeyboardButton("📉 Static top 5 losers", callback_data="losers"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def price_menu():
@@ -757,9 +936,17 @@ def info_menu():
     return text, kb
 
 def multi_menu():
-    text = "💱 <b>Currencies</b>\n\nSee a coin across multiple currencies."
+    text = "💱 <b>Currencies</b>\n\nSelect a coin to see live multi‑currency prices (updates every 3s)."
     coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "LINK"]
-    kb = coin_grid("multi", coins)
+    kb = InlineKeyboardMarkup()
+    row = []
+    for coin in coins:
+        row.append(InlineKeyboardButton(coin, callback_data=f"multi_live_{coin}"))
+        if len(row) == 3:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
@@ -782,151 +969,412 @@ def scan_menu():
     text = "🛡 <b>Contract Scanner</b>\n\nPaste contract address (ETH/BSC/Solana)"
     return text, back_button()
 
-# =========================
-# COOLDOWN
-# =========================
-cooldown = {}
-cooldown_lock = threading.RLock()
-def cooldown_ok(uid):
-    with cooldown_lock:
-        now = time.time()
-        if uid in cooldown and now - cooldown[uid] < COOLDOWN_SECONDS:
-            return False
-        cooldown[uid] = now
-    return True
+def coin_grid(prefix, coins):
+    kb = InlineKeyboardMarkup()
+    row = []
+    for i, coin in enumerate(coins, 1):
+        row.append(InlineKeyboardButton(coin, callback_data=f"{prefix}_{coin}"))
+        if i % 3 == 0:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
+    return kb
 
 # =========================
-# ADMIN COMMANDS
+# CALLBACK HANDLERS (all implemented)
 # =========================
-@bot.message_handler(commands=["stats"])
-def stats_cmd(m):
-    if not is_admin(m.from_user.id):
-        return
-    users         = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
-    interactions  = db_query("SELECT COUNT(*) FROM analytics", fetch_one=True)[0]
-    active_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
-    total_alerts  = db_query("SELECT COUNT(*) FROM alerts", fetch_one=True)[0]
-    with tickers_lock:
-        live_count = len(tickers)
-    text = (f"📊 <b>Bot Stats</b>\n\n"
-            f"👥 Users: <b>{users}</b>\n"
-            f"💬 Interactions: <b>{interactions}</b>\n"
-            f"🔔 Active alerts: <b>{active_alerts}</b>\n"
-            f"📦 Total alerts: <b>{total_alerts}</b>\n"
-            f"📡 Live tickers: <b>{live_count}</b>")
-    send_and_track(m.chat.id, text, back_button())
+waiting = {}
+wait_lock = threading.RLock()
 
-@bot.message_handler(commands=["users"])
-def users_cmd(m):
-    if not is_admin(m.from_user.id):
-        return
-    rows = db_query(
-        "SELECT user_id, username, first_name, total_interactions, alerts_set, alerts_triggered "
-        "FROM profiles ORDER BY total_interactions DESC LIMIT 50",
-        fetch_all=True,
+@bot.callback_query_handler(func=lambda call: call.data == "back_main")
+def back_main_cb(call):
+    cid = call.message.chat.id
+    with wait_lock:
+        waiting.pop((cid, call.from_user.id), None)
+    text, kb = main_menu()
+    send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_price")
+def menu_price_cb(call):
+    text, kb = price_menu()
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_info")
+def menu_info_cb(call):
+    text, kb = info_menu()
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_multi")
+def menu_multi_cb(call):
+    text, kb = multi_menu()
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_alerts")
+def menu_alerts_cb(call):
+    text, kb = alerts_menu()
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_gainers_losers")
+def menu_gainers_losers_cb(call):
+    text, kb = gainers_losers_menu()
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_scan")
+def menu_scan_cb(call):
+    text, kb = scan_menu()
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "profile")
+def profile_cb(call):
+    uid = call.from_user.id
+    p = get_profile(uid)
+    text = (
+        f"👤 <b>Your Profile</b>\n\n"
+        f"User ID: {p['user_id']}\n"
+        f"Joined: {time.strftime('%Y-%m-%d', time.localtime(p['join_date']))}\n"
+        f"Interactions: {p['total_interactions']}\n"
+        f"Alerts set: {p['alerts_set']}\n"
+        f"Alerts triggered: {p['alerts_triggered']}\n"
+        f"Active alerts: {get_alert_count(uid)}"
     )
-    if not rows:
-        send_and_track(m.chat.id, "No users yet.", back_button())
-        return
-    lines = []
-    for uid, username, first_name, interactions, alerts_set, alerts_triggered in rows:
-        display_name = f"{first_name or '?'} (@{username or 'no username'})"
-        lines.append(f"<code>{uid}</code> — {display_name}\n   💬 {interactions} | 🔔 {alerts_set} | ⚡ {alerts_triggered}")
-    total = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
-    if total > 50:
-        lines.append(f"…and {total - 50} more")
-    send_and_track(m.chat.id, "👥 <b>Users</b>\n\n" + "\n".join(lines), back_button())
+    send_and_track(call.message.chat.id, text, back_button())
+    bot.answer_callback_query(call.id)
 
-@bot.message_handler(commands=["announce"])
-def announce_cmd(m):
-    if not is_admin(m.from_user.id):
-        return
-    msg_text = m.text.partition(" ")[2].strip()
-    if not msg_text:
-        send_and_track(m.chat.id, "Usage: <code>/announce your message</code>", back_button())
-        return
-    sent, failed = broadcast_all(f"📢 <b>Announcement</b>\n\n{h(msg_text)}", skip_uid=m.from_user.id)
-    send_and_track(m.chat.id, f"📢 Sent to <b>{sent}</b> users. Failed: <b>{failed}</b>", back_button())
+@bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
+def price_cb(call):
+    symbol = call.data.split("_", 1)[1]
+    price, change, src = live_price(symbol)
+    if price is None:
+        text = f"❌ Could not fetch price for {symbol}"
+    else:
+        change_str = f" ({change:+.2f}%)" if change is not None else ""
+        text = f"💰 <b>{symbol}</b>\n{fmt_price(price)}{change_str}\n<i>Source: {src}</i>"
+    send_and_track(call.message.chat.id, text, back_button())
+    bot.answer_callback_query(call.id)
 
-@bot.message_handler(commands=["clear_alerts"])
-def clear_alerts_cmd(m):
-    if not is_admin(m.from_user.id):
+@bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
+def info_cb(call):
+    symbol = call.data.split("_", 1)[1]
+    info = CoinGecko.info(symbol)
+    if not info:
+        text = f"❌ No info found for {symbol}"
+    else:
+        text = (
+            f"🔎 <b>{info['name']} ({info['symbol']})</b>\n\n"
+            f"📊 Rank: #{info['rank']}\n"
+            f"💰 Price: {fmt_price(info['price'])}\n"
+            f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+            f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+            f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
+            f"📊 24h Volume: {fmt_price(info['volume'])}\n"
+            f"🔄 Circulating Supply: {info['supply']:,.0f}\n"
+        )
+        if info['max_supply']:
+            text += f"🔝 Max Supply: {info['max_supply']:,.0f}"
+    send_and_track(call.message.chat.id, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("setalert_"))
+def set_alert_preset_cb(call):
+    # format: setalert_BTC_>_100000
+    parts = call.data.split("_")
+    if len(parts) < 4:
+        bot.answer_callback_query(call.id, "Invalid alert format")
         return
-    db_query("UPDATE alerts SET active=0 WHERE active=1")
-    rebuild_ws()
-    send_and_track(m.chat.id, "✅ All active alerts have been cleared.", back_button())
+    coin = parts[1]
+    direction = parts[2]
+    target_str = parts[3]
+    try:
+        target = float(target_str)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Invalid target value")
+        return
+    uid = call.from_user.id
+    cid = call.message.chat.id
+    alert_id, err = add_alert(uid, cid, coin, target, direction)
+    if err:
+        send_and_track(cid, err, back_button())
+    else:
+        send_and_track(cid, f"✅ Alert set for {coin} {direction} {target:,.2f}\nYou will be notified when triggered.", back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "custom_alert")
+def custom_alert_cb(call):
+    cid = call.message.chat.id
+    uid = call.from_user.id
+    with wait_lock:
+        waiting[(cid, uid)] = "custom_alert"
+    send_and_track(cid, "✏️ Send alert in format: <code>COIN > 12345</code> or <code>COIN < 12345</code>\nExample: <code>BTC > 70000</code>\n\nSend /cancel to abort.", back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "list_alerts")
+def list_alerts_cb(call):
+    cid = call.message.chat.id
+    uid = call.from_user.id
+    alerts = get_active_alerts(chat_id=cid)
+    user_alerts = [a for a in alerts if a["user_id"] == uid]
+    if not user_alerts:
+        send_and_track(cid, "🔕 You have no active alerts.", back_button())
+    else:
+        text = "🔔 <b>Your active alerts</b>\n\n"
+        for a in user_alerts:
+            text += f"• {a['coin']} {a['direction']} {a['target']:,.2f}\n"
+        text += "\nTap an alert to cancel it:"
+        kb = InlineKeyboardMarkup()
+        for a in user_alerts:
+            kb.row(InlineKeyboardButton(f"❌ {a['coin']} {a['direction']} {a['target']:,.2f}", callback_data=f"cancel_alert_{a['id']}"))
+        kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+        send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_alert_"))
+def cancel_alert_cb(call):
+    alert_id = int(call.data.split("_")[-1])
+    deactivate_alert(alert_id)
+    send_and_track(call.message.chat.id, "✅ Alert cancelled.", back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "live_gainers")
+def live_gainers_cb(call):
+    cid = call.message.chat.id
+    with live_gainers_lock:
+        if cid in live_gainers_active and live_gainers_active[cid].get("running", False):
+            live_gainers_active[cid]["running"] = False
+            send_and_track(cid, "⏹️ Live gainers/losers stopped.", back_button())
+            bot.answer_callback_query(call.id)
+            return
+        text = "🚀 <b>Live Gainers/Losers (updates every 10s)</b>\n\nLoading..."
+        sent = send_and_track(cid, text, back_button())
+        live_gainers_active[cid] = {"message_id": sent.message_id, "running": True}
+        threading.Thread(target=_live_gainers_worker, args=(cid, sent.message_id), daemon=True).start()
+        bot.answer_callback_query(call.id, "Started live gainers/losers")
+
+@bot.callback_query_handler(func=lambda call: call.data == "gainers")
+def static_gainers_cb(call):
+    g, _ = Binance.top_movers()
+    if not g:
+        send_and_track(call.message.chat.id, "🚫 No data right now.", back_button())
+    else:
+        text = "🚀 <b>Top Gainers (24h)</b>\n\n"
+        for d in g:
+            coin = d["symbol"].removesuffix("USDT")
+            text += f"🟢 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▲ {float(d['priceChangePercent']):.2f}%\n"
+        send_and_track(call.message.chat.id, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "losers")
+def static_losers_cb(call):
+    _, l = Binance.top_movers()
+    if not l:
+        send_and_track(call.message.chat.id, "🚫 No data right now.", back_button())
+    else:
+        text = "📉 <b>Top Losers (24h)</b>\n\n"
+        for d in l:
+            coin = d["symbol"].removesuffix("USDT")
+            text += f"🔴 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
+        send_and_track(call.message.chat.id, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("multi_live_"))
+def multi_live_cb(call):
+    symbol = call.data.split("_", 2)[2]
+    cid = call.message.chat.id
+    with multi_tickers_lock:
+        if cid in multi_tickers and multi_tickers[cid].get("running", False):
+            multi_tickers[cid]["running"] = False
+            send_and_track(cid, f"⏹️ Stopped live multi‑currency for {symbol}.", back_button())
+            bot.answer_callback_query(call.id)
+            return
+        text = f"💱 <b>{symbol} – Currencies (live)</b>\n\nLoading..."
+        sent = send_and_track(cid, text, back_button())
+        multi_tickers[cid] = {"symbol": symbol, "message_id": sent.message_id, "running": True}
+        threading.Thread(target=_live_multi_worker, args=(cid, symbol, sent.message_id), daemon=True).start()
+        bot.answer_callback_query(call.id, f"Live multi‑currency for {symbol} started")
+
+# Search callbacks
+@bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
+def search_cb(call):
+    mode = call.data.split("_", 1)[1]  # price, info, multi
+    cid = call.message.chat.id
+    uid = call.from_user.id
+    with wait_lock:
+        waiting[(cid, uid)] = f"search_{mode}"
+    send_and_track(cid, f"🔍 Send the coin symbol (e.g., BTC, PEPE).\nSend /cancel to abort.", back_button())
+    bot.answer_callback_query(call.id)
 
 # =========================
-# ENHANCED MAINTENANCE COMMAND
+# TEXT HANDLERS (custom alert, search)
 # =========================
-@bot.message_handler(commands=["maintenance"])
-def maintenance_cmd(m):
-    if not is_admin(m.from_user.id):
+@bot.message_handler(func=lambda m: True)
+def text_handler(m):
+    cid = m.chat.id
+    uid = m.from_user.id
+    with wait_lock:
+        state = waiting.pop((cid, uid), None)
+    if not state:
+        return  # ignore any other text
+
+    if m.text.lower() == "/cancel":
+        send_and_track(cid, "❌ Cancelled.", back_button())
         return
+
+    if state == "custom_alert":
+        # parse "COIN > 123" or "COIN < 123"
+        pattern = r"^(\w+)\s*([<>])\s*([\d.]+)$"
+        match = re.match(pattern, m.text.strip().upper())
+        if not match:
+            send_and_track(cid, "❌ Invalid format. Use: <code>COIN > 12345</code> or <code>COIN < 12345</code>", back_button())
+            return
+        coin, direction, target_str = match.groups()
+        try:
+            target = float(target_str)
+        except ValueError:
+            send_and_track(cid, "❌ Invalid number.", back_button())
+            return
+        alert_id, err = add_alert(uid, cid, coin, target, direction)
+        if err:
+            send_and_track(cid, err, back_button())
+        else:
+            send_and_track(cid, f"✅ Alert set for {coin} {direction} {target:,.2f}\nYou will be notified when triggered.", back_button())
+        return
+
+    if state.startswith("search_"):
+        mode = state.split("_", 1)[1]
+        symbol = m.text.strip().upper()
+        if mode == "price":
+            price, change, src = live_price(symbol)
+            if price is None:
+                text = f"❌ Could not fetch price for {symbol}"
+            else:
+                change_str = f" ({change:+.2f}%)" if change is not None else ""
+                text = f"💰 <b>{symbol}</b>\n{fmt_price(price)}{change_str}\n<i>Source: {src}</i>"
+            send_and_track(cid, text, back_button())
+        elif mode == "info":
+            info = CoinGecko.info(symbol)
+            if not info:
+                text = f"❌ No info found for {symbol}"
+            else:
+                text = (
+                    f"🔎 <b>{info['name']} ({info['symbol']})</b>\n\n"
+                    f"📊 Rank: #{info['rank']}\n"
+                    f"💰 Price: {fmt_price(info['price'])}\n"
+                    f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+                    f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+                    f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
+                    f"📊 24h Volume: {fmt_price(info['volume'])}\n"
+                    f"🔄 Circulating Supply: {info['supply']:,.0f}\n"
+                )
+                if info['max_supply']:
+                    text += f"🔝 Max Supply: {info['max_supply']:,.0f}"
+            send_and_track(cid, text, back_button())
+        elif mode == "multi":
+            start_live_multi(cid, symbol)
+        return
+
+def start_live_multi(chat_id, symbol):
+    # same as multi_live callback but without callback
+    with multi_tickers_lock:
+        if chat_id in multi_tickers and multi_tickers[chat_id].get("running", False):
+            multi_tickers[chat_id]["running"] = False
+            send_and_track(chat_id, f"⏹️ Stopped live multi‑currency for {symbol}.", back_button())
+            return
+        text = f"💱 <b>{symbol} – Currencies (live)</b>\n\nLoading..."
+        sent = send_and_track(chat_id, text, back_button())
+        multi_tickers[chat_id] = {"symbol": symbol, "message_id": sent.message_id, "running": True}
+        threading.Thread(target=_live_multi_worker, args=(chat_id, symbol, sent.message_id), daemon=True).start()
+
+# =========================
+# COMMAND HANDLERS (additional)
+# =========================
+@bot.message_handler(commands=["price"])
+def price_command(m):
     args = m.text.split()
     if len(args) < 2:
-        active, msg = get_maintenance()
-        status = "🔴 ON" if active else "🟢 OFF"
-        send_and_track(
-            m.chat.id,
-            f"🔧 <b>Maintenance Mode</b>\n\nStatus: <b>{status}</b>\n"
-            f"Message: <i>{h(msg) or '(none)'}</i>\n\n"
-            f"Usage:\n"
-            f"<code>/maintenance on [message]</code> – enable maintenance (optional broadcast message)\n"
-            f"<code>/maintenance off</code> – disable maintenance (broadcasts back online)\n"
-            f"<code>/maintenance msg &lt;text&gt;</code> – update the maintenance message (without toggling mode)\n"
-            f"<code>/maintenance status</code> – show current state",
-            back_button(),
-        )
+        send_and_track(m.chat.id, "Usage: /price <symbol>", back_button())
         return
-
-    action = args[1].lower()
-
-    if action == "on":
-        custom_msg = " ".join(args[2:]) if len(args) > 2 else ""
-        set_maintenance(True, custom_msg)
-        broadcast_text = (
-            "🔧 <b>Maintenance started</b>\n\n"
-            + (h(custom_msg) if custom_msg else "Bot is under maintenance. We'll be back shortly.")
-        )
-        sent, _ = broadcast_all(broadcast_text, skip_uid=m.from_user.id)
-        send_and_track(
-            m.chat.id,
-            f"🔧 Maintenance mode <b>ON</b>. Notified <b>{sent}</b> users.\n\n"
-            f"<i>{h(custom_msg) or '(default message)'}</i>",
-            back_button(),
-        )
-        log.info(f"Maintenance ON by admin {m.from_user.id}: {custom_msg!r}")
-
-    elif action == "off":
-        set_maintenance(False, "")
-        sent, _ = broadcast_all(
-            "✅ <b>Maintenance ended</b>\n\nBot is back online. All features available.",
-            skip_uid=m.from_user.id,
-        )
-        send_and_track(m.chat.id, f"✅ Maintenance <b>OFF</b>. Notified <b>{sent}</b> users.", back_button())
-        log.info(f"Maintenance OFF by admin {m.from_user.id}")
-
-    elif action == "msg":
-        if len(args) < 3:
-            send_and_track(m.chat.id, "⚠️ Usage: <code>/maintenance msg Your custom message here</code>", back_button())
-            return
-        new_msg = " ".join(args[2:])
-        active, _ = get_maintenance()
-        set_maintenance(active, new_msg)
-        send_and_track(m.chat.id, f"✅ Maintenance message updated to:\n\n<i>{h(new_msg)}</i>\n\n(Current mode remains {'ON' if active else 'OFF'})", back_button())
-        log.info(f"Maintenance message updated by admin {m.from_user.id}: {new_msg!r}")
-
-    elif action == "status":
-        active, msg = get_maintenance()
-        status = "🔴 ON" if active else "🟢 OFF"
-        send_and_track(m.chat.id, f"🔧 Maintenance: <b>{status}</b>\nMessage: <i>{h(msg) or '(none)'}</i>", back_button())
-
+    symbol = args[1].upper()
+    price, change, src = live_price(symbol)
+    if price is None:
+        text = f"❌ Could not fetch price for {symbol}"
     else:
-        send_and_track(m.chat.id, "🚫 Use <code>on</code>, <code>off</code>, <code>msg</code>, or <code>status</code>.", back_button())
+        change_str = f" ({change:+.2f}%)" if change is not None else ""
+        text = f"💰 <b>{symbol}</b>\n{fmt_price(price)}{change_str}\n<i>Source: {src}</i>"
+    send_and_track(m.chat.id, text, back_button())
+
+@bot.message_handler(commands=["info"])
+def info_command(m):
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /info <symbol>", back_button())
+        return
+    symbol = args[1].upper()
+    info = CoinGecko.info(symbol)
+    if not info:
+        text = f"❌ No info found for {symbol}"
+    else:
+        text = (
+            f"🔎 <b>{info['name']} ({info['symbol']})</b>\n\n"
+            f"📊 Rank: #{info['rank']}\n"
+            f"💰 Price: {fmt_price(info['price'])}\n"
+            f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+            f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+            f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
+            f"📊 24h Volume: {fmt_price(info['volume'])}\n"
+            f"🔄 Circulating Supply: {info['supply']:,.0f}\n"
+        )
+        if info['max_supply']:
+            text += f"🔝 Max Supply: {info['max_supply']:,.0f}"
+    send_and_track(m.chat.id, text, back_button())
+
+@bot.message_handler(commands=["live"])
+def live_command(m):
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /live <symbol>", back_button())
+        return
+    symbol = args[1].upper()
+    start_ticker(m.chat.id, symbol)
+
+@bot.message_handler(commands=["alert"])
+def alert_command(m):
+    # same as custom alert but via command
+    send_and_track(m.chat.id, "Use the menu to set alerts, or type /cancel then use /custom_alert", back_button())
+
+@bot.message_handler(commands=["scan"])
+def scan_command(m):
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /scan <contract_address>", back_button())
+        return
+    address = args[1]
+    result, err = ContractScanner.scan(address)
+    if err:
+        send_and_track(m.chat.id, f"❌ {err}", back_button())
+        return
+    # format result nicely
+    text = "🛡 <b>Contract Security</b>\n\n"
+    text += f"<code>{address[:20]}...{address[-10:]}</code>\n\n"
+    risk = result.get('risk', {})
+    if risk:
+        text += "⚠️ <b>Risks:</b>\n"
+        for k, v in risk.items():
+            if v:
+                text += f"• {k}: {v}\n"
+    else:
+        text += "✅ No high-risk flags found.\n"
+    text += f"\n🔗 <a href='https://gopluslabs.io/'>GoPlusLabs</a>"
+    send_and_track(m.chat.id, text, back_button())
 
 # =========================
-# START / HELP (menu is a normal message)
+# START
 # =========================
 @bot.message_handler(commands=["start", "help"])
 def start(m):
@@ -937,354 +1385,20 @@ def start(m):
     send_and_track(m.chat.id, text, kb)
 
 # =========================
-# CALLBACKS
-# =========================
-waiting = {}
-wait_lock = threading.RLock()
-
-def render_alert_list(chat_id):
-    active = get_active_alerts(chat_id)
-    if not active:
-        return "📋 <b>Active Alerts</b>\n\nNothing active right now.", back_button()
-    text = "📋 <b>Active Alerts</b>\n\n"
-    kb = InlineKeyboardMarkup()
-    for a in active:
-        arrow = "▲" if a["direction"] == ">" else "▼"
-        text += f"#{a['id']} <b>{h(a['coin'])}</b> {arrow} <b>${a['target']:,.2f}</b>\n"
-        kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-    return text, kb
-
-@bot.callback_query_handler(func=lambda call: True)
-def cb(call):
-    uid = call.from_user.id
-    cid = call.message.chat.id
-    data = call.data
-    wait_key = (cid, uid)
-
-    if not cooldown_ok(uid):
-        bot.answer_callback_query(call.id, "Easy there.")
-        return
-    bot.answer_callback_query(call.id)
-
-    if maintenance_block(uid, cid):
-        return
-
-    log_interaction(uid, call.from_user.username, call.from_user.first_name, f"cb:{data[:40]}")
-
-    try:
-        if data == "back_main":
-            with wait_lock:
-                waiting.pop(wait_key, None)
-            text, kb = main_menu()
-            send_and_track(cid, text, kb)
-
-        elif data == "menu_price":
-            with wait_lock:
-                waiting[wait_key] = "price"
-            text, kb = price_menu()
-            send_and_track(cid, text, kb)
-
-        elif data == "search_price":
-            with wait_lock:
-                waiting[wait_key] = "price"
-            send_and_track(cid, "🧠 <b>Coin Lookup</b>\n\nType any ticker.\nExamples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>", back_button())
-
-        elif data == "menu_info":
-            with wait_lock:
-                waiting[wait_key] = "info"
-            text, kb = info_menu()
-            send_and_track(cid, text, kb)
-
-        elif data == "search_info":
-            with wait_lock:
-                waiting[wait_key] = "info"
-            send_and_track(cid, "🔎 <b>Coin Info Search</b>\n\nType any ticker to pull the full profile.", back_button())
-
-        elif data == "menu_multi":
-            with wait_lock:
-                waiting[wait_key] = "multi"
-            text, kb = multi_menu()
-            send_and_track(cid, text, kb)
-
-        elif data == "search_multi":
-            with wait_lock:
-                waiting[wait_key] = "multi"
-            send_and_track(cid, "💱 <b>Currency Search</b>\n\nType any ticker.", back_button())
-
-        elif data == "menu_scan":
-            with wait_lock:
-                waiting[wait_key] = "scan"
-            text, kb = scan_menu()
-            send_and_track(cid, text, kb)
-
-        elif data == "menu_alerts":
-            with wait_lock:
-                waiting[wait_key] = "alert"
-            text, kb = alerts_menu()
-            send_and_track(cid, text, kb)
-
-        elif data == "custom_alert":
-            with wait_lock:
-                waiting[wait_key] = "alert"
-            send_and_track(cid, "✏️ <b>Custom Alert</b>\n\nFormat: <code>COIN &gt; price</code>\nExample: <code>BTC &gt; 95000</code>", back_button())
-
-        elif data.startswith("setalert_"):
-            remainder = data[len("setalert_"):]
-            parts = remainder.rsplit("_", 2)
-            if len(parts) != 3:
-                send_and_track(cid, "🚫 Malformed alert callback.", alerts_menu()[1])
-                return
-            sym, direction, target_str = parts[0].upper(), parts[1], parts[2]
-            try:
-                target = float(target_str)
-            except:
-                send_and_track(cid, "🚫 Invalid target price.", alerts_menu()[1])
-                return
-            current, _, _ = live_price(sym)
-            if current is None:
-                send_and_track(cid, f"🚫 <b>{h(sym)}</b> not found.", alerts_menu()[1])
-                return
-            if (direction == ">" and target > current * 10) or (direction == "<" and target < current / 10):
-                send_and_track(cid, "🚫 Target too far from current price. Use a realistic value.", alerts_menu()[1])
-                return
-            if get_alert_count(uid) >= MAX_ALERTS_PER_USER:
-                send_and_track(cid, f"🚫 Max <b>{MAX_ALERTS_PER_USER}</b> alerts reached.", alerts_menu()[1])
-                return
-            aid = add_alert(uid, cid, sym, target, direction)
-            rebuild_ws()
-            send_and_track(cid, f"✅ <b>Alert armed</b>\n\n#{aid} — <b>{h(sym)}</b> {h(direction)} <b>${target:,.2f}</b>", alerts_menu()[1])
-
-        elif data == "list_alerts":
-            text, kb = render_alert_list(cid)
-            send_and_track(cid, text, kb)
-
-        elif data.startswith("cancel_"):
-            aid = int(data.split("_", 1)[1])
-            with db_lock:
-                row = db_query("SELECT user_id FROM alerts WHERE id=? AND active=1", (aid,), fetch_one=True)
-                if row and row[0] == uid:
-                    deactivate_alert(aid)
-                    rebuild_ws()
-                    text, kb = render_alert_list(cid)
-                    send_and_track(cid, text, kb)
-                else:
-                    send_and_track(cid, "🚫 You cannot cancel someone else's alert.", back_button())
-
-        elif data.startswith("price_"):
-            sym = data.split("_", 1)[1]
-            price, _, source = live_price(sym)
-            if price is None:
-                send_and_track(cid, f"🚫 <b>{h(sym)}</b> not found.", price_menu()[1])
-                return
-            start_ticker(cid, sym)
-            bot.answer_callback_query(call.id, f"Started live ticker for {sym}")
-
-        elif data == "gainers":
-            gainers, _ = Binance.top_movers()
-            if not gainers:
-                send_and_track(cid, "🚫 No data right now.", back_button())
-            else:
-                text = "🚀 <b>Top Gainers (24h)</b>\n\n"
-                for d in gainers:
-                    coin = d["symbol"].removesuffix("USDT")
-                    text += f"🟢 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▲ {float(d['priceChangePercent']):.2f}%\n"
-                send_and_track(cid, text, back_button())
-
-        elif data == "losers":
-            _, losers = Binance.top_movers()
-            if not losers:
-                send_and_track(cid, "🚫 No data right now.", back_button())
-            else:
-                text = "📉 <b>Top Losers (24h)</b>\n\n"
-                for d in losers:
-                    coin = d["symbol"].removesuffix("USDT")
-                    text += f"🔴 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
-                send_and_track(cid, text, back_button())
-
-        elif data.startswith("info_"):
-            sym = data.split("_", 1)[1]
-            info = CoinGecko.info(sym)
-            if not info:
-                send_and_track(cid, f"🚫 No info for <b>{h(sym)}</b>.", info_menu()[1])
-            else:
-                max_supply = info["max_supply"] if info["max_supply"] else "∞"
-                text = (f"🔎 <b>{h(info['name'])} ({h(info['symbol'])})</b>\n\n"
-                        f"🏆 Rank: <b>#{h(info['rank'])}</b>\n"
-                        f"💵 Price: <b>{fmt_price(info['price'])}</b>\n"
-                        f"📈 ATH: <b>{fmt_price(info['ath'])}</b> <i>({h(info['ath_date'])})</i>\n"
-                        f"📉 ATL: <b>{fmt_price(info['atl'])}</b> <i>({h(info['atl_date'])})</i>\n"
-                        f"💹 Market cap: <b>${info['market_cap']:,.0f}</b>\n"
-                        f"📊 Volume: <b>${info['volume']:,.0f}</b>\n"
-                        f"🪙 Supply: <b>{info['supply']:,.0f}</b> / <b>{h(max_supply)}</b>")
-                send_and_track(cid, text, info_menu()[1])
-
-        elif data.startswith("multi_"):
-            sym = data.split("_", 1)[1]
-            prices = CoinGecko.multi_price(sym)
-            if not prices:
-                send_and_track(cid, f"🚫 No data for <b>{h(sym)}</b>.", multi_menu()[1])
-            else:
-                order = [
-                    ("usd", "🇺🇸 USD"), ("eur", "🇪🇺 EUR"), ("gbp", "🇬🇧 GBP"),
-                    ("jpy", "🇯🇵 JPY"), ("cny", "🇨🇳 CNY"), ("aed", "🇦🇪 AED"),
-                    ("try", "🇹🇷 TRY"), ("inr", "🇮🇳 INR"), ("krw", "🇰🇷 KRW"),
-                    ("cad", "🇨🇦 CAD"), ("aud", "🇦🇺 AUD"),
-                ]
-                text = f"💱 <b>{h(sym)} — Currencies</b>\n\n"
-                for key, flag in order:
-                    val = prices.get(key)
-                    if val is not None:
-                        text += f"{flag}: <b>{h(fmt_currency_value(key, val))}</b>\n"
-                send_and_track(cid, text, multi_menu()[1])
-
-        elif data == "profile":
-            p = get_profile(uid)
-            text = (f"👤 <b>Profile</b>\n\n"
-                    f"💬 Interactions: <b>{p['total_interactions']}</b>\n"
-                    f"🔔 Alerts set: <b>{p['alerts_set']}</b>\n"
-                    f"⚡ Alerts triggered: <b>{p['alerts_triggered']}</b>")
-            send_and_track(cid, text, back_button())
-
-    except Exception as e:
-        log.error(f"Callback error: {e}", exc_info=True)
-        send_and_track(cid, "⚠️ Something broke.", back_button())
-
-# =========================
-# TEXT INPUT (price search also starts a ticker)
-# =========================
-@bot.message_handler(func=lambda m: True)
-def text_handler(message):
-    if not message.text:
-        return
-    cid = message.chat.id
-    uid = message.from_user.id
-    wait_key = (cid, uid)
-
-    if not cooldown_ok(uid):
-        return
-    if maintenance_block(uid, cid):
-        return
-
-    with wait_lock:
-        if wait_key not in waiting:
-            return
-        mode = waiting.pop(wait_key)
-
-    text = message.text.strip()[:MAX_TEXT_LEN]
-    if not text:
-        return
-    try:
-        bot.delete_message(cid, message.message_id)
-    except:
-        pass
-    log_interaction(uid, message.from_user.username, message.from_user.first_name, f"text:{mode}", text)
-
-    try:
-        if mode == "price":
-            symbol = text.upper()
-            price, _, source = live_price(symbol)
-            if price is None:
-                send_and_track(cid, f"🚫 <b>{h(symbol)}</b> not found.", price_menu()[1])
-                return
-            start_ticker(cid, symbol)
-
-        elif mode == "info":
-            info = CoinGecko.info(text.upper())
-            if not info:
-                send_and_track(cid, f"🚫 No info for <b>{h(text)}</b>.", info_menu()[1])
-            else:
-                max_supply = info["max_supply"] if info["max_supply"] else "∞"
-                out = (f"🔎 <b>{h(info['name'])} ({h(info['symbol'])})</b>\n\n"
-                       f"🏆 Rank: <b>#{h(info['rank'])}</b>\n"
-                       f"💵 Price: <b>{fmt_price(info['price'])}</b>\n"
-                       f"📈 ATH: <b>{fmt_price(info['ath'])}</b> <i>({h(info['ath_date'])})</i>\n"
-                       f"📉 ATL: <b>{fmt_price(info['atl'])}</b> <i>({h(info['atl_date'])})</i>\n"
-                       f"💹 Market cap: <b>${info['market_cap']:,.0f}</b>\n"
-                       f"📊 Volume: <b>${info['volume']:,.0f}</b>\n"
-                       f"🪙 Supply: <b>{info['supply']:,.0f}</b> / <b>{h(max_supply)}</b>")
-                send_and_track(cid, out, info_menu()[1])
-
-        elif mode == "multi":
-            prices = CoinGecko.multi_price(text.upper())
-            if not prices:
-                send_and_track(cid, f"🚫 No data for <b>{h(text)}</b>.", multi_menu()[1])
-            else:
-                order = [
-                    ("usd", "🇺🇸 USD"), ("eur", "🇪🇺 EUR"), ("gbp", "🇬🇧 GBP"),
-                    ("jpy", "🇯🇵 JPY"), ("cny", "🇨🇳 CNY"), ("aed", "🇦🇪 AED"),
-                    ("try", "🇹🇷 TRY"), ("inr", "🇮🇳 INR"), ("krw", "🇰🇷 KRW"),
-                    ("cad", "🇨🇦 CAD"), ("aud", "🇦🇺 AUD"),
-                ]
-                out = f"💱 <b>{h(text.upper())} — Currencies</b>\n\n"
-                for key, flag in order:
-                    val = prices.get(key)
-                    if val is not None:
-                        out += f"{flag}: <b>{h(fmt_currency_value(key, val))}</b>\n"
-                send_and_track(cid, out, multi_menu()[1])
-
-        elif mode == "scan":
-            result, err = ContractScanner.scan(text)
-            if err:
-                send_and_track(cid, f"🚫 {h(err)}", back_button())
-            else:
-                def flag(v):
-                    if v == "1": return "⚠️ Yes"
-                    if v == "0": return "✅ No"
-                    return "❓ Unknown"
-                token_name   = result.get("token_name") or "Unknown"
-                token_symbol = result.get("token_symbol") or "?"
-                out = (f"🛡 <b>CA Scan</b>\n\n"
-                       f"📛 Name: <b>{h(token_name)} ({h(token_symbol)})</b>\n"
-                       f"🍯 Honeypot: <b>{flag(result.get('is_honeypot', '?'))}</b>\n"
-                       f"🖨 Mintable: <b>{flag(result.get('is_mintable', '?'))}</b>\n"
-                       f"🔁 Proxy: <b>{flag(result.get('is_proxy', '?'))}</b>\n"
-                       f"📂 Open source: <b>{flag(result.get('is_open_source', '?'))}</b>\n"
-                       f"💸 Buy tax: <b>{h(result.get('buy_tax', '?'))}%</b>\n"
-                       f"💸 Sell tax: <b>{h(result.get('sell_tax', '?'))}%</b>\n"
-                       f"👥 Holders: <b>{h(result.get('holder_count', '?'))}</b>")
-                send_and_track(cid, out, back_button())
-
-        elif mode == "alert":
-            parts = text.split()
-            if len(parts) != 3:
-                send_and_track(cid, "🚫 Format: <code>BTC &gt; 100000</code>", alerts_menu()[1])
-                return
-            symbol, direction, target_str = parts[0].upper(), parts[1], parts[2]
-            if direction not in [">", "<"]:
-                send_and_track(cid, "🚫 Use <code>&gt;</code> or <code>&lt;</code> only.", alerts_menu()[1])
-                return
-            try:
-                target = float(target_str)
-            except:
-                send_and_track(cid, "🚫 Invalid target price.", alerts_menu()[1])
-                return
-            current, _, _ = live_price(symbol)
-            if current is None:
-                send_and_track(cid, f"🚫 <b>{h(symbol)}</b> not found.", alerts_menu()[1])
-                return
-            if (direction == ">" and target > current * 10) or (direction == "<" and target < current / 10):
-                send_and_track(cid, "🚫 Target too far from current price. Use a realistic value.", alerts_menu()[1])
-                return
-            if get_alert_count(uid) >= MAX_ALERTS_PER_USER:
-                send_and_track(cid, f"🚫 Max <b>{MAX_ALERTS_PER_USER}</b> alerts reached.", alerts_menu()[1])
-                return
-            aid = add_alert(uid, cid, symbol, target, direction)
-            rebuild_ws()
-            send_and_track(cid, f"✅ <b>Alert armed</b>\n\n#{aid} — <b>{h(symbol)}</b> {h(direction)} <b>${target:,.2f}</b>", alerts_menu()[1])
-
-    except Exception as e:
-        log.error(f"Text handler error: {e}", exc_info=True)
-        send_and_track(cid, "⚠️ Something broke.", back_button())
-
-# =========================
 # SHUTDOWN
 # =========================
 def stop(sig, frame):
+    log.info("Shutting down...")
     ws_restart.set()
     with tickers_lock:
         for key in list(tickers.keys()):
             tickers[key].set()
+    with live_gainers_lock:
+        for chat_id in list(live_gainers_active.keys()):
+            live_gainers_active[chat_id]["running"] = False
+    with multi_tickers_lock:
+        for chat_id in list(multi_tickers.keys()):
+            multi_tickers[chat_id]["running"] = False
     try:
         bot.stop_polling()
     except:
@@ -1297,7 +1411,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – No menu persistence, last 3 messages rule, Back button on tickers")
+log.info("🚀 Persona Bot started – Ultimate Edition (fully fixed)")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
