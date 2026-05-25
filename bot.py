@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final Production Build (9‑coin grid, live ticker, maintenance)
+Persona Bot – Final Production Build (Live ticker fixed, 9‑coin grid, "Back" button)
 """
 
 import telebot
@@ -614,7 +614,7 @@ def alert_loop():
 threading.Thread(target=alert_loop, daemon=True).start()
 
 # =========================
-# LIVE TICKER MANAGER
+# LIVE TICKER MANAGER (FIXED)
 # =========================
 active_tickers = {}
 tickers_lock = threading.RLock()
@@ -633,6 +633,8 @@ def start_live_ticker(chat_id, user_id, symbol, msg_id):
         stop_event = threading.Event()
         active_tickers[key] = stop_event
 
+    # Small delay to ensure the message is fully sent before editing
+    time.sleep(0.5)
     threading.Thread(
         target=_live_ticker_updater,
         args=(chat_id, user_id, symbol, msg_id, stop_event),
@@ -648,6 +650,8 @@ def _live_ticker_updater(chat_id, user_id, symbol, msg_id, stop_event):
         source_is_binance = False
 
     last_price = None
+    # Immediately do a first update
+    first_run = True
 
     while not stop_event.is_set():
         try:
@@ -678,14 +682,19 @@ def _live_ticker_updater(chat_id, user_id, symbol, msg_id, stop_event):
                     f"<i>Source: {src} · updates every 3s</i>"
                 )
 
+            # Edit the message
             bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML")
+            first_run = False
 
         except Exception as e:
             log.warning(f"Live ticker edit failed ({key}): {e}")
+            # If editing fails (e.g., message deleted), stop the ticker
             break
 
+        # Wait for next update, but allow early stop
         stop_event.wait(timeout=3)
 
+    # Cleanup
     with tickers_lock:
         if active_tickers.get(key) is stop_event:
             del active_tickers[key]
@@ -709,11 +718,11 @@ def send_and_track(chat_id, text, markup=None):
     return sent
 
 # =========================
-# UI / MENUS (9‑coin grid, updated text)
+# UI / MENUS (9‑coin grid, "Back" button)
 # =========================
 def back_button():
     kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
 def coin_grid(prefix, coins):
@@ -748,7 +757,7 @@ def price_menu():
     coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
     kb = coin_grid("price", coins)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_price"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def info_menu():
@@ -756,15 +765,15 @@ def info_menu():
     coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
     kb = coin_grid("info", coins)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_info"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def multi_menu():
     text = "💱 <b>Currencies</b>\n\nSee a coin across multiple currencies."
-    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "LINK"]  # 7 coins (will have a 3‑3‑1 layout, acceptable)
+    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "LINK"]  # 7 coins (3-3-1 layout)
     kb = coin_grid("multi", coins)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def alerts_menu():
@@ -778,7 +787,7 @@ def alerts_menu():
            InlineKeyboardButton("SOL < 100", callback_data="setalert_SOL_<_100"))
     kb.row(InlineKeyboardButton("✏️ Custom alert", callback_data="custom_alert"))
     kb.row(InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def scan_menu():
@@ -939,7 +948,7 @@ def render_alert_list(chat_id):
         arrow = "▲" if a["direction"] == ">" else "▼"
         text += f"#{a['id']} <b>{h(a['coin'])}</b> {arrow} <b>${a['target']:,.2f}</b>\n"
         kb.row(InlineKeyboardButton(f"❌ Cancel #{a['id']}", callback_data=f"cancel_{a['id']}"))
-    kb.row(InlineKeyboardButton("⬅️ Back to cockpit", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -1280,6 +1289,6 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – 9‑coin grid, live ticker, maintenance mode")
+log.info("🚀 Persona Bot started – live ticker fixed, 9‑coin grid, 'Back' button")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
