@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final: Menu Never Deleted, Last 3 Tickers, Enhanced Maintenance
-- Main menu persists (never removed)
-- Price requests create new live tickers (3 max)
-- Maintenance mode: /maintenance on|off|msg|status
-- All other features: alerts, scanner, info, currencies, admin, etc.
+Persona Bot – Final: No menu persistence, last 3 messages rule for all
+- Each price request creates a live ticker with a 'Back' button
+- Menu is a normal message (subject to 3‑message limit)
+- 'Back' button regenerates the main menu
 """
 
 import telebot
@@ -38,7 +37,7 @@ COOLDOWN_SECONDS = 2
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
 MAX_TEXT_LEN = 200
-MAX_HISTORY = 3          # number of tickers/results to keep (menu excluded)
+MAX_HISTORY = 3          # keep only last 3 messages total
 MAX_LIVE_TICKERS = 50
 MAINTENANCE_SPAM_COOLDOWN = 60
 
@@ -614,44 +613,37 @@ def alert_loop():
 threading.Thread(target=alert_loop, daemon=True).start()
 
 # =========================
-# MESSAGE QUEUE WITH MENU PERSISTENCE
+# MESSAGE QUEUE (no special persistence – all messages count)
 # =========================
 msg_queue = {}
-menu_msg_id = {}  # chat_id -> menu message id
 q_lock = threading.RLock()
 
-def send_and_track(chat_id, text, markup=None, is_menu=False):
+def send_and_track(chat_id, text, markup=None):
     sent = bot.send_message(chat_id, text, reply_markup=markup, disable_web_page_preview=True)
     with q_lock:
         if chat_id not in msg_queue:
             msg_queue[chat_id] = []
         msg_queue[chat_id].append(sent.message_id)
-        if is_menu:
-            menu_msg_id[chat_id] = sent.message_id
-        # Cleanup: keep only last MAX_HISTORY messages, but never delete the menu message
-        queue = msg_queue[chat_id]
-        while len(queue) > MAX_HISTORY:
-            # If the menu message is the oldest, delete the second oldest instead
-            if queue[0] == menu_msg_id.get(chat_id):
-                if len(queue) > 1:
-                    old = queue.pop(1)
-                else:
-                    break
-            else:
-                old = queue.pop(0)
+        # Keep only last MAX_HISTORY messages
+        while len(msg_queue[chat_id]) > MAX_HISTORY:
+            old = msg_queue[chat_id].pop(0)
             try:
                 bot.delete_message(chat_id, old)
             except Exception as e:
                 log.warning(f"Failed to delete message {old}: {e}")
     return sent
 
-# For tickers, we don't mark them as menu
+def back_button():
+    kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return kb
+
 def send_ticker(chat_id, symbol):
-    sent = send_and_track(chat_id, f"⏳ Starting live ticker for {symbol}...", None, is_menu=False)
+    sent = send_and_track(chat_id, f"⏳ Starting live ticker for {symbol}...", back_button())
     return sent
 
 # =========================
-# MULTIPLE LIVE TICKERS (one per price request)
+# MULTIPLE LIVE TICKERS (one per price request) with Back button
 # =========================
 tickers = {}  # key = (chat_id, ticker_id) -> stop_event
 tickers_lock = threading.RLock()
@@ -702,7 +694,7 @@ def _ticker_worker(chat_id, symbol, msg_id, stop_event, key):
                     f"{change_str}\n\n"
                     f"<i>Source: {src} · updates every 3s</i>"
                 )
-            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML")
+            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
         except ApiTelegramException as e:
             if "message is not modified" not in str(e):
                 log.warning(f"Ticker edit fatal ({key}): {e}")
@@ -722,11 +714,6 @@ def start_ticker(chat_id, symbol):
 # =========================
 # UI / MENUS
 # =========================
-def back_button():
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-    return kb
-
 def coin_grid(prefix, coins):
     kb = InlineKeyboardMarkup()
     row = []
@@ -827,7 +814,7 @@ def stats_cmd(m):
             f"🔔 Active alerts: <b>{active_alerts}</b>\n"
             f"📦 Total alerts: <b>{total_alerts}</b>\n"
             f"📡 Live tickers: <b>{live_count}</b>")
-    send_and_track(m.chat.id, text, back_button(), is_menu=False)
+    send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["users"])
 def users_cmd(m):
@@ -839,7 +826,7 @@ def users_cmd(m):
         fetch_all=True,
     )
     if not rows:
-        send_and_track(m.chat.id, "No users yet.", back_button(), is_menu=False)
+        send_and_track(m.chat.id, "No users yet.", back_button())
         return
     lines = []
     for uid, username, first_name, interactions, alerts_set, alerts_triggered in rows:
@@ -848,7 +835,7 @@ def users_cmd(m):
     total = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
     if total > 50:
         lines.append(f"…and {total - 50} more")
-    send_and_track(m.chat.id, "👥 <b>Users</b>\n\n" + "\n".join(lines), back_button(), is_menu=False)
+    send_and_track(m.chat.id, "👥 <b>Users</b>\n\n" + "\n".join(lines), back_button())
 
 @bot.message_handler(commands=["announce"])
 def announce_cmd(m):
@@ -856,10 +843,10 @@ def announce_cmd(m):
         return
     msg_text = m.text.partition(" ")[2].strip()
     if not msg_text:
-        send_and_track(m.chat.id, "Usage: <code>/announce your message</code>", back_button(), is_menu=False)
+        send_and_track(m.chat.id, "Usage: <code>/announce your message</code>", back_button())
         return
     sent, failed = broadcast_all(f"📢 <b>Announcement</b>\n\n{h(msg_text)}", skip_uid=m.from_user.id)
-    send_and_track(m.chat.id, f"📢 Sent to <b>{sent}</b> users. Failed: <b>{failed}</b>", back_button(), is_menu=False)
+    send_and_track(m.chat.id, f"📢 Sent to <b>{sent}</b> users. Failed: <b>{failed}</b>", back_button())
 
 @bot.message_handler(commands=["clear_alerts"])
 def clear_alerts_cmd(m):
@@ -867,7 +854,7 @@ def clear_alerts_cmd(m):
         return
     db_query("UPDATE alerts SET active=0 WHERE active=1")
     rebuild_ws()
-    send_and_track(m.chat.id, "✅ All active alerts have been cleared.", back_button(), is_menu=False)
+    send_and_track(m.chat.id, "✅ All active alerts have been cleared.", back_button())
 
 # =========================
 # ENHANCED MAINTENANCE COMMAND
@@ -889,7 +876,7 @@ def maintenance_cmd(m):
             f"<code>/maintenance off</code> – disable maintenance (broadcasts back online)\n"
             f"<code>/maintenance msg &lt;text&gt;</code> – update the maintenance message (without toggling mode)\n"
             f"<code>/maintenance status</code> – show current state",
-            back_button(), is_menu=False,
+            back_button(),
         )
         return
 
@@ -907,7 +894,7 @@ def maintenance_cmd(m):
             m.chat.id,
             f"🔧 Maintenance mode <b>ON</b>. Notified <b>{sent}</b> users.\n\n"
             f"<i>{h(custom_msg) or '(default message)'}</i>",
-            back_button(), is_menu=False,
+            back_button(),
         )
         log.info(f"Maintenance ON by admin {m.from_user.id}: {custom_msg!r}")
 
@@ -917,30 +904,29 @@ def maintenance_cmd(m):
             "✅ <b>Maintenance ended</b>\n\nBot is back online. All features available.",
             skip_uid=m.from_user.id,
         )
-        send_and_track(m.chat.id, f"✅ Maintenance <b>OFF</b>. Notified <b>{sent}</b> users.", back_button(), is_menu=False)
+        send_and_track(m.chat.id, f"✅ Maintenance <b>OFF</b>. Notified <b>{sent}</b> users.", back_button())
         log.info(f"Maintenance OFF by admin {m.from_user.id}")
 
     elif action == "msg":
         if len(args) < 3:
-            send_and_track(m.chat.id, "⚠️ Usage: <code>/maintenance msg Your custom message here</code>", back_button(), is_menu=False)
+            send_and_track(m.chat.id, "⚠️ Usage: <code>/maintenance msg Your custom message here</code>", back_button())
             return
         new_msg = " ".join(args[2:])
-        # Update message without changing active status
         active, _ = get_maintenance()
         set_maintenance(active, new_msg)
-        send_and_track(m.chat.id, f"✅ Maintenance message updated to:\n\n<i>{h(new_msg)}</i>\n\n(Current mode remains {'ON' if active else 'OFF'})", back_button(), is_menu=False)
+        send_and_track(m.chat.id, f"✅ Maintenance message updated to:\n\n<i>{h(new_msg)}</i>\n\n(Current mode remains {'ON' if active else 'OFF'})", back_button())
         log.info(f"Maintenance message updated by admin {m.from_user.id}: {new_msg!r}")
 
     elif action == "status":
         active, msg = get_maintenance()
         status = "🔴 ON" if active else "🟢 OFF"
-        send_and_track(m.chat.id, f"🔧 Maintenance: <b>{status}</b>\nMessage: <i>{h(msg) or '(none)'}</i>", back_button(), is_menu=False)
+        send_and_track(m.chat.id, f"🔧 Maintenance: <b>{status}</b>\nMessage: <i>{h(msg) or '(none)'}</i>", back_button())
 
     else:
-        send_and_track(m.chat.id, "🚫 Use <code>on</code>, <code>off</code>, <code>msg</code>, or <code>status</code>.", back_button(), is_menu=False)
+        send_and_track(m.chat.id, "🚫 Use <code>on</code>, <code>off</code>, <code>msg</code>, or <code>status</code>.", back_button())
 
 # =========================
-# START / HELP (menu is marked as is_menu=True)
+# START / HELP (menu is a normal message)
 # =========================
 @bot.message_handler(commands=["start", "help"])
 def start(m):
@@ -948,7 +934,7 @@ def start(m):
         return
     log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
     text, kb = main_menu()
-    send_and_track(m.chat.id, text, kb, is_menu=True)
+    send_and_track(m.chat.id, text, kb)
 
 # =========================
 # CALLBACKS
@@ -991,87 +977,87 @@ def cb(call):
             with wait_lock:
                 waiting.pop(wait_key, None)
             text, kb = main_menu()
-            send_and_track(cid, text, kb, is_menu=True)
+            send_and_track(cid, text, kb)
 
         elif data == "menu_price":
             with wait_lock:
                 waiting[wait_key] = "price"
             text, kb = price_menu()
-            send_and_track(cid, text, kb, is_menu=False)
+            send_and_track(cid, text, kb)
 
         elif data == "search_price":
             with wait_lock:
                 waiting[wait_key] = "price"
-            send_and_track(cid, "🧠 <b>Coin Lookup</b>\n\nType any ticker.\nExamples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>", back_button(), is_menu=False)
+            send_and_track(cid, "🧠 <b>Coin Lookup</b>\n\nType any ticker.\nExamples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>", back_button())
 
         elif data == "menu_info":
             with wait_lock:
                 waiting[wait_key] = "info"
             text, kb = info_menu()
-            send_and_track(cid, text, kb, is_menu=False)
+            send_and_track(cid, text, kb)
 
         elif data == "search_info":
             with wait_lock:
                 waiting[wait_key] = "info"
-            send_and_track(cid, "🔎 <b>Coin Info Search</b>\n\nType any ticker to pull the full profile.", back_button(), is_menu=False)
+            send_and_track(cid, "🔎 <b>Coin Info Search</b>\n\nType any ticker to pull the full profile.", back_button())
 
         elif data == "menu_multi":
             with wait_lock:
                 waiting[wait_key] = "multi"
             text, kb = multi_menu()
-            send_and_track(cid, text, kb, is_menu=False)
+            send_and_track(cid, text, kb)
 
         elif data == "search_multi":
             with wait_lock:
                 waiting[wait_key] = "multi"
-            send_and_track(cid, "💱 <b>Currency Search</b>\n\nType any ticker.", back_button(), is_menu=False)
+            send_and_track(cid, "💱 <b>Currency Search</b>\n\nType any ticker.", back_button())
 
         elif data == "menu_scan":
             with wait_lock:
                 waiting[wait_key] = "scan"
             text, kb = scan_menu()
-            send_and_track(cid, text, kb, is_menu=False)
+            send_and_track(cid, text, kb)
 
         elif data == "menu_alerts":
             with wait_lock:
                 waiting[wait_key] = "alert"
             text, kb = alerts_menu()
-            send_and_track(cid, text, kb, is_menu=False)
+            send_and_track(cid, text, kb)
 
         elif data == "custom_alert":
             with wait_lock:
                 waiting[wait_key] = "alert"
-            send_and_track(cid, "✏️ <b>Custom Alert</b>\n\nFormat: <code>COIN &gt; price</code>\nExample: <code>BTC &gt; 95000</code>", back_button(), is_menu=False)
+            send_and_track(cid, "✏️ <b>Custom Alert</b>\n\nFormat: <code>COIN &gt; price</code>\nExample: <code>BTC &gt; 95000</code>", back_button())
 
         elif data.startswith("setalert_"):
             remainder = data[len("setalert_"):]
             parts = remainder.rsplit("_", 2)
             if len(parts) != 3:
-                send_and_track(cid, "🚫 Malformed alert callback.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, "🚫 Malformed alert callback.", alerts_menu()[1])
                 return
             sym, direction, target_str = parts[0].upper(), parts[1], parts[2]
             try:
                 target = float(target_str)
             except:
-                send_and_track(cid, "🚫 Invalid target price.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, "🚫 Invalid target price.", alerts_menu()[1])
                 return
             current, _, _ = live_price(sym)
             if current is None:
-                send_and_track(cid, f"🚫 <b>{h(sym)}</b> not found.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 <b>{h(sym)}</b> not found.", alerts_menu()[1])
                 return
             if (direction == ">" and target > current * 10) or (direction == "<" and target < current / 10):
-                send_and_track(cid, "🚫 Target too far from current price. Use a realistic value.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, "🚫 Target too far from current price. Use a realistic value.", alerts_menu()[1])
                 return
             if get_alert_count(uid) >= MAX_ALERTS_PER_USER:
-                send_and_track(cid, f"🚫 Max <b>{MAX_ALERTS_PER_USER}</b> alerts reached.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 Max <b>{MAX_ALERTS_PER_USER}</b> alerts reached.", alerts_menu()[1])
                 return
             aid = add_alert(uid, cid, sym, target, direction)
             rebuild_ws()
-            send_and_track(cid, f"✅ <b>Alert armed</b>\n\n#{aid} — <b>{h(sym)}</b> {h(direction)} <b>${target:,.2f}</b>", alerts_menu()[1], is_menu=False)
+            send_and_track(cid, f"✅ <b>Alert armed</b>\n\n#{aid} — <b>{h(sym)}</b> {h(direction)} <b>${target:,.2f}</b>", alerts_menu()[1])
 
         elif data == "list_alerts":
             text, kb = render_alert_list(cid)
-            send_and_track(cid, text, kb, is_menu=False)
+            send_and_track(cid, text, kb)
 
         elif data.startswith("cancel_"):
             aid = int(data.split("_", 1)[1])
@@ -1081,15 +1067,15 @@ def cb(call):
                     deactivate_alert(aid)
                     rebuild_ws()
                     text, kb = render_alert_list(cid)
-                    send_and_track(cid, text, kb, is_menu=False)
+                    send_and_track(cid, text, kb)
                 else:
-                    send_and_track(cid, "🚫 You cannot cancel someone else's alert.", back_button(), is_menu=False)
+                    send_and_track(cid, "🚫 You cannot cancel someone else's alert.", back_button())
 
         elif data.startswith("price_"):
             sym = data.split("_", 1)[1]
             price, _, source = live_price(sym)
             if price is None:
-                send_and_track(cid, f"🚫 <b>{h(sym)}</b> not found.", price_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 <b>{h(sym)}</b> not found.", price_menu()[1])
                 return
             start_ticker(cid, sym)
             bot.answer_callback_query(call.id, f"Started live ticker for {sym}")
@@ -1097,30 +1083,30 @@ def cb(call):
         elif data == "gainers":
             gainers, _ = Binance.top_movers()
             if not gainers:
-                send_and_track(cid, "🚫 No data right now.", back_button(), is_menu=False)
+                send_and_track(cid, "🚫 No data right now.", back_button())
             else:
                 text = "🚀 <b>Top Gainers (24h)</b>\n\n"
                 for d in gainers:
                     coin = d["symbol"].removesuffix("USDT")
                     text += f"🟢 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▲ {float(d['priceChangePercent']):.2f}%\n"
-                send_and_track(cid, text, back_button(), is_menu=False)
+                send_and_track(cid, text, back_button())
 
         elif data == "losers":
             _, losers = Binance.top_movers()
             if not losers:
-                send_and_track(cid, "🚫 No data right now.", back_button(), is_menu=False)
+                send_and_track(cid, "🚫 No data right now.", back_button())
             else:
                 text = "📉 <b>Top Losers (24h)</b>\n\n"
                 for d in losers:
                     coin = d["symbol"].removesuffix("USDT")
                     text += f"🔴 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
-                send_and_track(cid, text, back_button(), is_menu=False)
+                send_and_track(cid, text, back_button())
 
         elif data.startswith("info_"):
             sym = data.split("_", 1)[1]
             info = CoinGecko.info(sym)
             if not info:
-                send_and_track(cid, f"🚫 No info for <b>{h(sym)}</b>.", info_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 No info for <b>{h(sym)}</b>.", info_menu()[1])
             else:
                 max_supply = info["max_supply"] if info["max_supply"] else "∞"
                 text = (f"🔎 <b>{h(info['name'])} ({h(info['symbol'])})</b>\n\n"
@@ -1131,13 +1117,13 @@ def cb(call):
                         f"💹 Market cap: <b>${info['market_cap']:,.0f}</b>\n"
                         f"📊 Volume: <b>${info['volume']:,.0f}</b>\n"
                         f"🪙 Supply: <b>{info['supply']:,.0f}</b> / <b>{h(max_supply)}</b>")
-                send_and_track(cid, text, info_menu()[1], is_menu=False)
+                send_and_track(cid, text, info_menu()[1])
 
         elif data.startswith("multi_"):
             sym = data.split("_", 1)[1]
             prices = CoinGecko.multi_price(sym)
             if not prices:
-                send_and_track(cid, f"🚫 No data for <b>{h(sym)}</b>.", multi_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 No data for <b>{h(sym)}</b>.", multi_menu()[1])
             else:
                 order = [
                     ("usd", "🇺🇸 USD"), ("eur", "🇪🇺 EUR"), ("gbp", "🇬🇧 GBP"),
@@ -1150,7 +1136,7 @@ def cb(call):
                     val = prices.get(key)
                     if val is not None:
                         text += f"{flag}: <b>{h(fmt_currency_value(key, val))}</b>\n"
-                send_and_track(cid, text, multi_menu()[1], is_menu=False)
+                send_and_track(cid, text, multi_menu()[1])
 
         elif data == "profile":
             p = get_profile(uid)
@@ -1158,11 +1144,11 @@ def cb(call):
                     f"💬 Interactions: <b>{p['total_interactions']}</b>\n"
                     f"🔔 Alerts set: <b>{p['alerts_set']}</b>\n"
                     f"⚡ Alerts triggered: <b>{p['alerts_triggered']}</b>")
-            send_and_track(cid, text, back_button(), is_menu=False)
+            send_and_track(cid, text, back_button())
 
     except Exception as e:
         log.error(f"Callback error: {e}", exc_info=True)
-        send_and_track(cid, "⚠️ Something broke.", back_button(), is_menu=False)
+        send_and_track(cid, "⚠️ Something broke.", back_button())
 
 # =========================
 # TEXT INPUT (price search also starts a ticker)
@@ -1199,14 +1185,14 @@ def text_handler(message):
             symbol = text.upper()
             price, _, source = live_price(symbol)
             if price is None:
-                send_and_track(cid, f"🚫 <b>{h(symbol)}</b> not found.", price_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 <b>{h(symbol)}</b> not found.", price_menu()[1])
                 return
             start_ticker(cid, symbol)
 
         elif mode == "info":
             info = CoinGecko.info(text.upper())
             if not info:
-                send_and_track(cid, f"🚫 No info for <b>{h(text)}</b>.", info_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 No info for <b>{h(text)}</b>.", info_menu()[1])
             else:
                 max_supply = info["max_supply"] if info["max_supply"] else "∞"
                 out = (f"🔎 <b>{h(info['name'])} ({h(info['symbol'])})</b>\n\n"
@@ -1217,12 +1203,12 @@ def text_handler(message):
                        f"💹 Market cap: <b>${info['market_cap']:,.0f}</b>\n"
                        f"📊 Volume: <b>${info['volume']:,.0f}</b>\n"
                        f"🪙 Supply: <b>{info['supply']:,.0f}</b> / <b>{h(max_supply)}</b>")
-                send_and_track(cid, out, info_menu()[1], is_menu=False)
+                send_and_track(cid, out, info_menu()[1])
 
         elif mode == "multi":
             prices = CoinGecko.multi_price(text.upper())
             if not prices:
-                send_and_track(cid, f"🚫 No data for <b>{h(text)}</b>.", multi_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 No data for <b>{h(text)}</b>.", multi_menu()[1])
             else:
                 order = [
                     ("usd", "🇺🇸 USD"), ("eur", "🇪🇺 EUR"), ("gbp", "🇬🇧 GBP"),
@@ -1235,12 +1221,12 @@ def text_handler(message):
                     val = prices.get(key)
                     if val is not None:
                         out += f"{flag}: <b>{h(fmt_currency_value(key, val))}</b>\n"
-                send_and_track(cid, out, multi_menu()[1], is_menu=False)
+                send_and_track(cid, out, multi_menu()[1])
 
         elif mode == "scan":
             result, err = ContractScanner.scan(text)
             if err:
-                send_and_track(cid, f"🚫 {h(err)}", back_button(), is_menu=False)
+                send_and_track(cid, f"🚫 {h(err)}", back_button())
             else:
                 def flag(v):
                     if v == "1": return "⚠️ Yes"
@@ -1257,39 +1243,39 @@ def text_handler(message):
                        f"💸 Buy tax: <b>{h(result.get('buy_tax', '?'))}%</b>\n"
                        f"💸 Sell tax: <b>{h(result.get('sell_tax', '?'))}%</b>\n"
                        f"👥 Holders: <b>{h(result.get('holder_count', '?'))}</b>")
-                send_and_track(cid, out, back_button(), is_menu=False)
+                send_and_track(cid, out, back_button())
 
         elif mode == "alert":
             parts = text.split()
             if len(parts) != 3:
-                send_and_track(cid, "🚫 Format: <code>BTC &gt; 100000</code>", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, "🚫 Format: <code>BTC &gt; 100000</code>", alerts_menu()[1])
                 return
             symbol, direction, target_str = parts[0].upper(), parts[1], parts[2]
             if direction not in [">", "<"]:
-                send_and_track(cid, "🚫 Use <code>&gt;</code> or <code>&lt;</code> only.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, "🚫 Use <code>&gt;</code> or <code>&lt;</code> only.", alerts_menu()[1])
                 return
             try:
                 target = float(target_str)
             except:
-                send_and_track(cid, "🚫 Invalid target price.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, "🚫 Invalid target price.", alerts_menu()[1])
                 return
             current, _, _ = live_price(symbol)
             if current is None:
-                send_and_track(cid, f"🚫 <b>{h(symbol)}</b> not found.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 <b>{h(symbol)}</b> not found.", alerts_menu()[1])
                 return
             if (direction == ">" and target > current * 10) or (direction == "<" and target < current / 10):
-                send_and_track(cid, "🚫 Target too far from current price. Use a realistic value.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, "🚫 Target too far from current price. Use a realistic value.", alerts_menu()[1])
                 return
             if get_alert_count(uid) >= MAX_ALERTS_PER_USER:
-                send_and_track(cid, f"🚫 Max <b>{MAX_ALERTS_PER_USER}</b> alerts reached.", alerts_menu()[1], is_menu=False)
+                send_and_track(cid, f"🚫 Max <b>{MAX_ALERTS_PER_USER}</b> alerts reached.", alerts_menu()[1])
                 return
             aid = add_alert(uid, cid, symbol, target, direction)
             rebuild_ws()
-            send_and_track(cid, f"✅ <b>Alert armed</b>\n\n#{aid} — <b>{h(symbol)}</b> {h(direction)} <b>${target:,.2f}</b>", alerts_menu()[1], is_menu=False)
+            send_and_track(cid, f"✅ <b>Alert armed</b>\n\n#{aid} — <b>{h(symbol)}</b> {h(direction)} <b>${target:,.2f}</b>", alerts_menu()[1])
 
     except Exception as e:
         log.error(f"Text handler error: {e}", exc_info=True)
-        send_and_track(cid, "⚠️ Something broke.", back_button(), is_menu=False)
+        send_and_track(cid, "⚠️ Something broke.", back_button())
 
 # =========================
 # SHUTDOWN
@@ -1311,7 +1297,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – Menu never deleted, last 3 tickers kept, enhanced maintenance")
+log.info("🚀 Persona Bot started – No menu persistence, last 3 messages rule, Back button on tickers")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
