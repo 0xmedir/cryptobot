@@ -2,7 +2,7 @@
 """
 Persona Bot – Ultimate Edition (fully fixed)
 - Whale alerts removed
-- Etherscan V2 with env API key
+- Etherscan V2 with env API key (wallet checker removed)
 - All menu handlers implemented
 - WebSocket auto-reconnect
 - Admin commands
@@ -13,6 +13,7 @@ FIXES APPLIED:
   3. init_db() migration changes are committed immediately
   4. alert_command now opens the alerts menu instead of referencing /custom_alert
   5. /price /info /live /scan all check maintenance_block()
+  6. Wallet checker feature removed completely
 """
 
 import telebot
@@ -93,7 +94,6 @@ def db_query(query, params=(), fetch_one=False, fetch_all=False, retries=3):
             raise
     return None
 
-# ── FIX #3: commit after each migration step so changes survive a crash ─────
 def init_db():
     try:
         cur = conn.cursor()
@@ -104,12 +104,12 @@ def init_db():
             if "streak" in columns:
                 log.info("Old profiles schema detected. Dropping and recreating.")
                 conn.execute("DROP TABLE profiles")
-                conn.commit()                          # ← FIX #3
+                conn.commit()
             elif "username" not in columns:
                 log.info("Adding username and first_name columns to profiles.")
                 conn.execute("ALTER TABLE profiles ADD COLUMN username TEXT")
                 conn.execute("ALTER TABLE profiles ADD COLUMN first_name TEXT")
-                conn.commit()                          # ← FIX #3
+                conn.commit()
     except Exception as e:
         log.error(f"Migration check error: {e}")
 
@@ -351,7 +351,7 @@ class Binance:
             return None, None
 
     @staticmethod
-    def top_movers():
+    def top_movers(limit=10):
         cached = price_cache.get("top_movers")
         if cached:
             return cached
@@ -368,7 +368,9 @@ class Binance:
                 and float(d.get("quoteVolume", 0)) > 1_000_000
             ]
             sorted_data = sorted(filtered, key=lambda x: float(x["priceChangePercent"]), reverse=True)
-            result = sorted_data[:5], sorted_data[-5:][::-1]
+            gainers = sorted_data[:limit]
+            losers = sorted_data[-limit:][::-1]
+            result = (gainers, losers)
             price_cache.set("top_movers", result, ttl=30)
             return result
         except Exception as e:
@@ -749,12 +751,12 @@ def _live_gainers_worker(chat_id, msg_id):
         if not gainers:
             text = "❌ Failed to fetch data. Will retry..."
         else:
-            text = "🚀 <b>Live Gainers/Losers</b>\n\n"
-            text += "📈 <b>Top 5 Gainers</b>\n"
+            text = "🚀 <b>Live Gainers/Losers (Top 10)</b>\n\n"
+            text += "📈 <b>Top 10 Gainers</b>\n"
             for d in gainers:
                 coin = d["symbol"].removesuffix("USDT")
                 text += f"🟢 {coin}  ▲ {float(d['priceChangePercent']):.2f}%\n"
-            text += "\n📉 <b>Top 5 Losers</b>\n"
+            text += "\n📉 <b>Top 10 Losers</b>\n"
             for d in losers:
                 coin = d["symbol"].removesuffix("USDT")
                 text += f"🔴 {coin}  ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
@@ -808,53 +810,6 @@ def _live_multi_worker(chat_id, symbol, msg_id):
             time.sleep(1)
     with multi_tickers_lock:
         multi_tickers.pop(chat_id, None)
-
-# =========================
-# WALLET CHECKER (Etherscan V2)
-# =========================
-@bot.message_handler(commands=["wallet"])
-def wallet_cmd(m):
-    if maintenance_block(m.from_user.id, m.chat.id):
-        return
-    args = m.text.split()
-    if len(args) < 2:
-        send_and_track(m.chat.id, "Usage: /wallet <address>\nSupports EVM (0x...) and Solana addresses.", back_button())
-        return
-    address = args[1].strip()
-    try:
-        if address.startswith("0x") and len(address) == 42:
-            url = f"https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address={address}&tag=latest&apikey={ETHERSCAN_API_KEY}"
-            r = session.get(url, timeout=10)
-            if r.status_code != 200:
-                send_and_track(m.chat.id, "❌ Failed to fetch balance.", back_button())
-                return
-            data = r.json()
-            if data.get("status") != "1":
-                send_and_track(m.chat.id, f"❌ Error: {data.get('message', 'Unknown')}", back_button())
-                return
-            balance_wei = int(data["result"])
-            balance_eth = balance_wei / 1e18
-            text = f"🏦 <b>EVM Wallet</b>\n\nAddress: <code>{address}</code>\nBalance: <b>{balance_eth:.6f} ETH</b>"
-            send_and_track(m.chat.id, text, back_button())
-        elif len(address) >= 32 and len(address) <= 44 and re.match(r'^[A-Za-z0-9]+$', address):
-            url = f"https://public-api.solscan.io/account/{address}"
-            r = session.get(url, timeout=10)
-            if r.status_code != 200:
-                send_and_track(m.chat.id, "❌ Failed to fetch Solana balance.", back_button())
-                return
-            data = r.json()
-            if not data or "lamports" not in data:
-                send_and_track(m.chat.id, "❌ Address not found or invalid.", back_button())
-                return
-            lamports = data["lamports"]
-            sol = lamports / 1e9
-            text = f"🏦 <b>Solana Wallet</b>\n\nAddress: <code>{address}</code>\nBalance: <b>{sol:.4f} SOL</b>"
-            send_and_track(m.chat.id, text, back_button())
-        else:
-            send_and_track(m.chat.id, "❌ Unrecognized address format.", back_button())
-    except Exception as e:
-        log.error(f"Wallet check error: {e}")
-        send_and_track(m.chat.id, "⚠️ Error checking wallet. Try again later.", back_button())
 
 # =========================
 # ADMIN COMMANDS
@@ -912,7 +867,7 @@ def start(m):
 
 @bot.message_handler(commands=["price"])
 def price_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id):      # ← FIX #5
+    if maintenance_block(m.from_user.id, m.chat.id):
         return
     args = m.text.split()
     if len(args) < 2:
@@ -929,7 +884,7 @@ def price_command(m):
 
 @bot.message_handler(commands=["info"])
 def info_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id):      # ← FIX #5
+    if maintenance_block(m.from_user.id, m.chat.id):
         return
     args = m.text.split()
     if len(args) < 2:
@@ -956,7 +911,7 @@ def info_command(m):
 
 @bot.message_handler(commands=["live"])
 def live_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id):      # ← FIX #5
+    if maintenance_block(m.from_user.id, m.chat.id):
         return
     args = m.text.split()
     if len(args) < 2:
@@ -965,7 +920,6 @@ def live_command(m):
     symbol = args[1].upper()
     start_ticker(m.chat.id, symbol)
 
-# ── FIX #4: /alert now opens the alerts menu ────────────────────────────────
 @bot.message_handler(commands=["alert"])
 def alert_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
@@ -975,7 +929,7 @@ def alert_command(m):
 
 @bot.message_handler(commands=["scan"])
 def scan_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id):      # ← FIX #5
+    if maintenance_block(m.from_user.id, m.chat.id):
         return
     args = m.text.split()
     if len(args) < 2:
@@ -987,7 +941,6 @@ def scan_command(m):
         send_and_track(m.chat.id, f"❌ {err}", back_button())
         return
 
-    # ── FIX #2: read actual GoPlusLabs top-level fields ─────────────────────
     text = "🛡 <b>Contract Security</b>\n\n"
     text += f"<code>{address[:20]}...{address[-10:]}</code>\n\n"
 
@@ -996,7 +949,7 @@ def scan_command(m):
         "is_mintable":    ("🖨 Mintable",           "1"),
         "is_proxy":       ("🔀 Proxy contract",     "1"),
         "is_blacklisted": ("⛔ Blacklist",          "1"),
-        "is_open_source": ("📄 Not open source",    "0"),   # "0" = bad
+        "is_open_source": ("📄 Not open source",    "0"),
     }
     NUMERIC_FLAGS = {
         "buy_tax":  "🛒 Buy tax",
@@ -1043,11 +996,11 @@ def main_menu():
     return text, kb
 
 def gainers_losers_menu():
-    text = "📊 <b>Gainers & Losers</b>\n\nChoose mode:"
+    text = "📊 <b>Gainers & Losers (Top 10)</b>\n\nChoose mode:"
     kb = InlineKeyboardMarkup()
     kb.row(InlineKeyboardButton("🔄 Live (updates every 10s)", callback_data="live_gainers"))
-    kb.row(InlineKeyboardButton("📈 Static top 5", callback_data="gainers"))
-    kb.row(InlineKeyboardButton("📉 Static top 5 losers", callback_data="losers"))
+    kb.row(InlineKeyboardButton("📈 Static top 10", callback_data="gainers"))
+    kb.row(InlineKeyboardButton("📉 Static top 10 losers", callback_data="losers"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
@@ -1282,7 +1235,7 @@ def live_gainers_cb(call):
             send_and_track(cid, "⏹️ Live gainers/losers stopped.", back_button())
             bot.answer_callback_query(call.id)
             return
-        text = "🚀 <b>Live Gainers/Losers (updates every 10s)</b>\n\nLoading..."
+        text = "🚀 <b>Live Gainers/Losers (updates every 10s, Top 10)</b>\n\nLoading..."
         sent = send_and_track(cid, text, back_button())
         live_gainers_active[cid] = {"message_id": sent.message_id, "running": True}
         threading.Thread(target=_live_gainers_worker, args=(cid, sent.message_id), daemon=True).start()
@@ -1294,7 +1247,7 @@ def static_gainers_cb(call):
     if not g:
         send_and_track(call.message.chat.id, "🚫 No data right now.", back_button())
     else:
-        text = "🚀 <b>Top Gainers (24h)</b>\n\n"
+        text = "🚀 <b>Top 10 Gainers (24h)</b>\n\n"
         for d in g:
             coin = d["symbol"].removesuffix("USDT")
             text += f"🟢 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▲ {float(d['priceChangePercent']):.2f}%\n"
@@ -1307,7 +1260,7 @@ def static_losers_cb(call):
     if not l:
         send_and_track(call.message.chat.id, "🚫 No data right now.", back_button())
     else:
-        text = "📉 <b>Top Losers (24h)</b>\n\n"
+        text = "📉 <b>Top 10 Losers (24h)</b>\n\n"
         for d in l:
             coin = d["symbol"].removesuffix("USDT")
             text += f"🔴 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
@@ -1342,20 +1295,17 @@ def search_cb(call):
 
 # =========================
 # TEXT HANDLER (catch-all)
-# ── FIX #1: skip commands so all registered command handlers work ────────────
 # =========================
 @bot.message_handler(func=lambda m: True)
 def text_handler(m):
-    # If it's a command, let the dedicated command handlers deal with it
     if m.text and m.text.startswith("/"):
         return
-
     cid = m.chat.id
     uid = m.from_user.id
     with wait_lock:
         state = waiting.pop((cid, uid), None)
     if not state:
-        return  # ignore plain text with no active state
+        return
 
     if m.text.lower() == "/cancel":
         send_and_track(cid, "❌ Cancelled.", back_button())
@@ -1451,7 +1401,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – Ultimate Edition (fully fixed)")
+log.info("🚀 Persona Bot started – Ultimate Edition (wallet checker removed)")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
