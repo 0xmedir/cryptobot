@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final Production Build (Live ticker fixed, 9‑coin grid, "Back" button)
+Persona Bot – Production‑Safe Final Build
+Fixes:
+  - Alert cancel ownership check
+  - Live ticker resilient to harmless edit errors
+  - No blocking sleep in callback path
+  - Maintenance mode per‑chat cooldown
+  - get_profile robust retry
 """
 
 import telebot
@@ -18,6 +24,7 @@ import html
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.apihelper import ApiTelegramException
 import websocket
 
 # =========================
@@ -35,6 +42,8 @@ MAX_CA_LENGTH = 100
 MAX_TEXT_LEN = 200
 MAX_HISTORY = 3
 MAX_LIVE_TICKERS = 50
+
+MAINTENANCE_SPAM_COOLDOWN = 60  # seconds per chat
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("PersonaBot")
@@ -225,8 +234,10 @@ def safe_first_200(text):
     return (text or "")[:200]
 
 # =========================
-# MAINTENANCE MODE
+# MAINTENANCE MODE (with per‑chat cooldown)
 # =========================
+maintenance_spam = {}  # chat_id -> last sent timestamp
+
 def get_maintenance():
     row = db_query("SELECT active, message FROM maintenance WHERE id=1", fetch_one=True)
     if not row:
@@ -242,6 +253,11 @@ def maintenance_block(uid, cid):
     active, msg = get_maintenance()
     if not active:
         return False
+    now = time.time()
+    last = maintenance_spam.get(cid, 0)
+    if now - last < MAINTENANCE_SPAM_COOLDOWN:
+        return True  # still block, but don't resend message
+    maintenance_spam[cid] = now
     bot.send_message(
         cid,
         "🔧 <b>Bot Under Maintenance</b>\n\n"
@@ -266,15 +282,18 @@ def broadcast_all(text, skip_uid=None):
     return sent, failed
 
 # =========================
-# PROFILES
+# PROFILES (robust)
 # =========================
 def get_profile(user_id):
     row = db_query("SELECT * FROM profiles WHERE user_id=?", (user_id,), fetch_one=True)
     if not row:
         now = int(time.time())
         db_query("INSERT OR IGNORE INTO profiles(user_id, join_date) VALUES(?,?)", (user_id, now))
+        # Retry once in case of race
+        time.sleep(0.05)
         row = db_query("SELECT * FROM profiles WHERE user_id=?", (user_id,), fetch_one=True)
         if not row:
+            log.warning(f"Could not create profile for user {user_id}, using fallback")
             return {
                 "user_id": user_id, "join_date": now,
                 "total_interactions": 0, "alerts_set": 0,
@@ -304,7 +323,7 @@ def is_admin(uid):
     return uid in ADMIN_IDS
 
 # =========================
-# SERVICES
+# SERVICES (Binance, CoinGecko, Scanner)
 # =========================
 class Binance:
     @staticmethod
@@ -614,56 +633,67 @@ def alert_loop():
 threading.Thread(target=alert_loop, daemon=True).start()
 
 # =========================
-# LIVE TICKER MANAGER (FIXED)
+# PERSISTENT LIVE TICKER (resilient)
 # =========================
-active_tickers = {}
-tickers_lock = threading.RLock()
+ticker_data = {}  # chat_id -> {"symbol": str, "message_id": int, "running": bool, "thread": threading.Thread}
+ticker_lock = threading.RLock()
 
-def start_live_ticker(chat_id, user_id, symbol, msg_id):
-    key = (chat_id, user_id)
+def stop_ticker(chat_id):
+    with ticker_lock:
+        if chat_id in ticker_data and ticker_data[chat_id].get("running"):
+            ticker_data[chat_id]["running"] = False
 
-    with tickers_lock:
-        if len(active_tickers) >= MAX_LIVE_TICKERS and key not in active_tickers:
-            bot.send_message(chat_id, "🚫 Too many live tickers active. Try again shortly.")
+def start_or_update_ticker(chat_id, symbol):
+    with ticker_lock:
+        if chat_id in ticker_data and ticker_data[chat_id].get("running"):
+            # Just update the symbol – the worker thread will pick it up
+            ticker_data[chat_id]["symbol"] = symbol
             return
+        # Create new ticker
+        placeholder = bot.send_message(chat_id, f"⏳ Starting live ticker for {symbol}...", disable_web_page_preview=True)
+        msg_id = placeholder.message_id
+        ticker_data[chat_id] = {
+            "symbol": symbol,
+            "message_id": msg_id,
+            "running": True,
+            "thread": None
+        }
+        th = threading.Thread(target=_ticker_updater, args=(chat_id,), daemon=True)
+        ticker_data[chat_id]["thread"] = th
+        th.start()
 
-        if key in active_tickers:
-            active_tickers[key].set()
+def _ticker_updater(chat_id):
+    # First, small delay to avoid blocking caller (moved from callback)
+    time.sleep(0.3)
+    with ticker_lock:
+        if chat_id not in ticker_data:
+            return
+        sym = ticker_data[chat_id]["symbol"]
+        msg_id = ticker_data[chat_id]["message_id"]
 
-        stop_event = threading.Event()
-        active_tickers[key] = stop_event
-
-    # Small delay to ensure the message is fully sent before editing
-    time.sleep(0.5)
-    threading.Thread(
-        target=_live_ticker_updater,
-        args=(chat_id, user_id, symbol, msg_id, stop_event),
-        daemon=True,
-    ).start()
-
-def _live_ticker_updater(chat_id, user_id, symbol, msg_id, stop_event):
-    key = (chat_id, user_id)
-    source_is_binance = True
-
-    test_price, test_change = Binance.price(symbol)
-    if test_price is None:
-        source_is_binance = False
-
+    test_price, _ = Binance.price(sym)
+    source_is_binance = test_price is not None
     last_price = None
-    # Immediately do a first update
-    first_run = True
 
-    while not stop_event.is_set():
+    while True:
+        with ticker_lock:
+            if chat_id not in ticker_data:
+                break
+            if not ticker_data[chat_id].get("running", False):
+                break
+            sym = ticker_data[chat_id]["symbol"]
+            msg_id = ticker_data[chat_id]["message_id"]
+
         try:
             if source_is_binance:
-                price, change = Binance.price(symbol)
+                price, change = Binance.price(sym)
             else:
-                info = CoinGecko.info(symbol)
+                info = CoinGecko.info(sym)
                 price = info["price"] if info else None
                 change = None
 
             if price is None:
-                text = f"❌ <b>{h(symbol)}</b> — price unavailable"
+                text = f"❌ <b>{h(sym)}</b> — price unavailable"
             else:
                 if change is not None:
                     arrow = "🟢▲" if change >= 0 else "🔴▼"
@@ -676,31 +706,37 @@ def _live_ticker_updater(chat_id, user_id, symbol, msg_id, stop_event):
                 last_price = price
                 src = "Binance" if source_is_binance else "CoinGecko"
                 text = (
-                    f"💵 <b>{h(symbol)}</b>  <i>live</i>\n\n"
+                    f"💵 <b>{h(sym)}</b>  <i>live</i>\n\n"
                     f"{fmt_price(price)}\n"
                     f"{change_str}\n\n"
                     f"<i>Source: {src} · updates every 3s</i>"
                 )
 
-            # Edit the message
             bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML")
-            first_run = False
 
+        except ApiTelegramException as e:
+            if "message is not modified" in str(e):
+                # harmless, ignore
+                pass
+            else:
+                log.warning(f"Ticker edit fatal error for chat {chat_id}: {e}")
+                with ticker_lock:
+                    if chat_id in ticker_data:
+                        ticker_data[chat_id]["running"] = False
+                break
         except Exception as e:
-            log.warning(f"Live ticker edit failed ({key}): {e}")
-            # If editing fails (e.g., message deleted), stop the ticker
-            break
+            # Temporary glitch – don't kill the ticker
+            log.warning(f"Ticker edit temporary error for chat {chat_id}: {e}")
 
-        # Wait for next update, but allow early stop
-        stop_event.wait(timeout=3)
+        time.sleep(3)
 
     # Cleanup
-    with tickers_lock:
-        if active_tickers.get(key) is stop_event:
-            del active_tickers[key]
+    with ticker_lock:
+        if chat_id in ticker_data and not ticker_data[chat_id].get("running", True):
+            ticker_data.pop(chat_id, None)
 
 # =========================
-# MESSAGE HISTORY
+# MESSAGE HISTORY (for other messages)
 # =========================
 msg_queue = {}
 q_lock = threading.RLock()
@@ -753,7 +789,6 @@ def main_menu():
 
 def price_menu():
     text = "💵 <b>Price Check</b>\n\nTap a coin or type a ticker.\nExamples: <code>BTC</code>, <code>PEPE</code>, <code>TAO</code>"
-    # 9 coins – 3×3 grid
     coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
     kb = coin_grid("price", coins)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_price"))
@@ -770,7 +805,7 @@ def info_menu():
 
 def multi_menu():
     text = "💱 <b>Currencies</b>\n\nSee a coin across multiple currencies."
-    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "LINK"]  # 7 coins (3-3-1 layout)
+    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "LINK"]
     kb = coin_grid("multi", coins)
     kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
@@ -819,8 +854,8 @@ def stats_cmd(m):
     interactions  = db_query("SELECT COUNT(*) FROM analytics", fetch_one=True)[0]
     active_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
     total_alerts  = db_query("SELECT COUNT(*) FROM alerts", fetch_one=True)[0]
-    with tickers_lock:
-        live_count = len(active_tickers)
+    with ticker_lock:
+        live_count = len(ticker_data)
     text = (f"📊 <b>Bot Stats</b>\n\n"
             f"👥 Users: <b>{users}</b>\n"
             f"💬 Interactions: <b>{interactions}</b>\n"
@@ -972,6 +1007,7 @@ def cb(call):
         if data == "back_main":
             with wait_lock:
                 waiting.pop(wait_key, None)
+            stop_ticker(cid)
             text, kb = main_menu()
             send_and_track(cid, text, kb)
 
@@ -1057,10 +1093,19 @@ def cb(call):
 
         elif data.startswith("cancel_"):
             aid = int(data.split("_", 1)[1])
-            deactivate_alert(aid)
-            rebuild_ws()
-            text, kb = render_alert_list(cid)
-            send_and_track(cid, text, kb)
+            # Ownership check
+            alert_to_cancel = None
+            with db_lock:
+                row = db_query("SELECT user_id FROM alerts WHERE id=? AND active=1", (aid,), fetch_one=True)
+                if row and row[0] == uid:
+                    alert_to_cancel = aid
+            if alert_to_cancel:
+                deactivate_alert(aid)
+                rebuild_ws()
+                text, kb = render_alert_list(cid)
+                send_and_track(cid, text, kb)
+            else:
+                send_and_track(cid, "🚫 You cannot cancel someone else's alert.", back_button())
 
         elif data.startswith("price_"):
             sym = data.split("_", 1)[1]
@@ -1068,8 +1113,8 @@ def cb(call):
             if price is None:
                 send_and_track(cid, f"🚫 <b>{h(sym)}</b> not found.", price_menu()[1])
                 return
-            sent = send_and_track(cid, f"⏳ Starting live ticker for <b>{h(sym)}</b>...", None)
-            start_live_ticker(cid, uid, sym, sent.message_id)
+            start_or_update_ticker(cid, sym)
+            bot.answer_callback_query(call.id, f"Live ticker now showing {sym}")
 
         elif data == "gainers":
             gainers, _ = Binance.top_movers()
@@ -1178,8 +1223,7 @@ def text_handler(message):
             if price is None:
                 send_and_track(cid, f"🚫 <b>{h(symbol)}</b> not found.", price_menu()[1])
                 return
-            sent = send_and_track(cid, f"⏳ Starting live ticker for <b>{h(symbol)}</b>...", None)
-            start_live_ticker(cid, uid, symbol, sent.message_id)
+            start_or_update_ticker(cid, symbol)
 
         elif mode == "info":
             info = CoinGecko.info(text.upper())
@@ -1274,9 +1318,9 @@ def text_handler(message):
 # =========================
 def stop(sig, frame):
     ws_restart.set()
-    with tickers_lock:
-        for ev in active_tickers.values():
-            ev.set()
+    with ticker_lock:
+        for chat_id in list(ticker_data.keys()):
+            ticker_data[chat_id]["running"] = False
     try:
         bot.stop_polling()
     except:
@@ -1289,6 +1333,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – live ticker fixed, 9‑coin grid, 'Back' button")
+log.info("🚀 Persona Bot started – production‑safe (ownership check, resilient ticker, anti‑spam maintenance)")
 bot.delete_webhook()
+time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
