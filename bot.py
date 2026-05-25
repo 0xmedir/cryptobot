@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final with Live Price Ticker
+Persona Bot – Merged Live Ticker for All Price Checks
+- Every price request becomes a live, animated display (updates every 3s).
+- No separate /live command needed.
+- Ticker stops automatically when replaced or cleaned up.
 """
 
 import telebot
@@ -604,45 +607,26 @@ def alert_loop():
 threading.Thread(target=alert_loop, daemon=True).start()
 
 # =========================
-# LIVE PRICE TICKER (ANIMATION)
+# LIVE TICKER MANAGER (for price checks)
 # =========================
-live_tickers = {}  # chat_id -> {"symbol": str, "message_id": int, "running": bool}
+active_tickers = {}  # chat_id -> {"running": bool, "thread": threading.Thread?} we'll use a flag
 
-@bot.message_handler(commands=["live"])
-def live_price_start(m):
-    if maintenance_block(m.from_user.id, m.chat.id):
-        return
-    args = m.text.split()
-    if len(args) < 2:
-        send_and_track(m.chat.id, "Usage: /live BTC\nStop with /stop_live", back_button())
-        return
-    symbol = args[1].upper()
-    # Check if coin exists
-    price, _ = Binance.price(symbol)
-    if price is None:
-        send_and_track(m.chat.id, f"❌ Symbol {symbol} not found.", back_button())
-        return
-    # Stop any existing live ticker for this chat
-    if m.chat.id in live_tickers and live_tickers[m.chat.id].get("running"):
-        live_tickers[m.chat.id]["running"] = False
-        time.sleep(0.5)
-    # Send initial message
-    sent = send_and_track(m.chat.id, f"⏳ Live price for {symbol} – updates every 3 seconds. Send /stop_live to end.", None)
-    live_tickers[m.chat.id] = {"symbol": symbol, "message_id": sent.message_id, "running": True}
-    threading.Thread(target=_live_price_updater, args=(m.chat.id, symbol, sent.message_id), daemon=True).start()
+def start_live_ticker(chat_id, symbol, initial_message_id):
+    """Start a live ticker that updates the given message every 3 seconds."""
+    # Stop any existing ticker for this chat
+    if chat_id in active_tickers:
+        active_tickers[chat_id]["running"] = False
+        # Give it a moment to stop
+        time.sleep(0.3)
+    # Set new ticker flag
+    active_tickers[chat_id] = {"running": True, "symbol": symbol, "msg_id": initial_message_id}
+    # Start updater thread
+    threading.Thread(target=_live_ticker_updater, args=(chat_id, symbol, initial_message_id), daemon=True).start()
 
-@bot.message_handler(commands=["stop_live"])
-def stop_live(m):
-    if m.chat.id in live_tickers and live_tickers[m.chat.id].get("running"):
-        live_tickers[m.chat.id]["running"] = False
-        send_and_track(m.chat.id, "⏹️ Live price updates stopped.", back_button())
-    else:
-        send_and_track(m.chat.id, "No active live price ticker.", back_button())
-
-def _live_price_updater(chat_id, symbol, msg_id):
+def _live_ticker_updater(chat_id, symbol, msg_id):
     step = 0
     arrows = ["🟢▲", "🔴▼", "🟢▲", "🔴▼"]
-    while live_tickers.get(chat_id, {}).get("running", False):
+    while active_tickers.get(chat_id, {}).get("running", False):
         price, change = Binance.price(symbol)
         if price is None:
             text = f"❌ Error fetching {symbol}"
@@ -652,11 +636,14 @@ def _live_price_updater(chat_id, symbol, msg_id):
         try:
             bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML")
         except Exception as e:
-            log.warning(f"Live ticker edit error: {e}")
+            # If edit fails (message deleted), stop the ticker
+            log.warning(f"Live ticker edit failed for {chat_id}: {e}")
+            active_tickers.pop(chat_id, None)
+            break
         step += 1
         time.sleep(3)
     # Cleanup
-    live_tickers.pop(chat_id, None)
+    active_tickers.pop(chat_id, None)
 
 # =========================
 # MESSAGE HISTORY
@@ -1006,18 +993,18 @@ def cb(call):
             text, kb = render_alert_list(cid)
             send_and_track(cid, text, kb)
 
+        # ---------- PRICE BUTTON: start live ticker ----------
         elif data.startswith("price_"):
             sym = data.split("_", 1)[1]
-            price, change, source = live_price(sym)
+            # Verify symbol exists
+            price, _ = Binance.price(sym)
             if price is None:
                 send_and_track(cid, f"🚫 <b>{h(sym)}</b> not found.", price_menu()[1])
-            else:
-                if source == "Binance" and change is not None:
-                    arrow = "🟢▲" if change >= 0 else "🔴▼"
-                    msg = f"💵 <b>{h(sym)}</b>\n\n{fmt_price(price)}\n{arrow} {abs(change):.2f}%\n\nSource: <b>Binance</b>"
-                else:
-                    msg = f"💵 <b>{h(sym)}</b>\n\n{fmt_price(price)}\n\nSource: <b>{h(source)}</b>"
-                send_and_track(cid, msg, price_menu()[1])
+                return
+            # Send a placeholder message that will be edited by the ticker
+            sent = send_and_track(cid, f"⏳ Loading live price for {sym}...", None)
+            # Start live ticker
+            start_live_ticker(cid, sym, sent.message_id)
 
         elif data == "gainers":
             gainers, _ = Binance.top_movers()
@@ -1090,7 +1077,7 @@ def cb(call):
         send_and_track(cid, "⚠️ Something broke.", back_button())
 
 # =========================
-# TEXT INPUT
+# TEXT INPUT (PRICE SEARCH)
 # =========================
 @bot.message_handler(func=lambda m: True)
 def text_handler(message):
@@ -1122,16 +1109,15 @@ def text_handler(message):
 
     try:
         if mode == "price":
-            price, change, source = live_price(text.upper())
+            symbol = text.upper()
+            # Verify symbol exists
+            price, _ = Binance.price(symbol)
             if price is None:
-                send_and_track(cid, f"🚫 <b>{h(text)}</b> not found.", price_menu()[1])
-            else:
-                if source == "Binance" and change is not None:
-                    arrow = "🟢▲" if change >= 0 else "🔴▼"
-                    out = f"💵 <b>{h(text.upper())}</b>\n\n{fmt_price(price)}\n{arrow} {abs(change):.2f}%\n\nSource: <b>Binance</b>"
-                else:
-                    out = f"💵 <b>{h(text.upper())}</b>\n\n{fmt_price(price)}\n\nSource: <b>{h(source)}</b>"
-                send_and_track(cid, out, price_menu()[1])
+                send_and_track(cid, f"🚫 <b>{h(symbol)}</b> not found.", price_menu()[1])
+                return
+            # Send placeholder and start live ticker
+            sent = send_and_track(cid, f"⏳ Loading live price for {symbol}...", None)
+            start_live_ticker(cid, symbol, sent.message_id)
 
         elif mode == "info":
             info = CoinGecko.info(text.upper())
@@ -1228,8 +1214,9 @@ def text_handler(message):
 # =========================
 def stop(sig, frame):
     ws_restart.set()
-    for data in live_tickers.values():
-        data["running"] = False
+    # Stop all active tickers
+    for chat_id in list(active_tickers.keys()):
+        active_tickers[chat_id]["running"] = False
     try:
         bot.stop_polling()
     except:
@@ -1242,6 +1229,6 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started (live price ticker added)")
+log.info("🚀 Persona Bot started – All price checks are live animated tickers (no separate /live command)")
 bot.delete_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
