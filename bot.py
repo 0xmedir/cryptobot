@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Ultimate Edition (fully fixed)
-- Whale alerts removed
-- Etherscan V2 with env API key (wallet checker removed)
-- All menu handlers implemented
-- WebSocket auto-reconnect
-- Admin commands
+Persona Bot – Ultimate Edition
+- Live Top 10 Gainers (updates every 10s) – no extra text
+- Live Top 10 Losers (updates every 10s) – no extra text
+- No static gainers/losers
 - Price menu: every coin starts a live ticker
-- Gainers/Losers: Top 10 live & static
-- Currencies: live multi-currency ticker
+- Multi‑currency live ticker
+- Wallet checker removed
 """
 
 import telebot
@@ -346,10 +344,11 @@ class Binance:
             return None, None
 
     @staticmethod
-    def top_movers(limit=10):
-        cached = price_cache.get("top_movers")
-        if cached:
-            return cached
+    def top_movers(limit=10, force_refresh=False):
+        if not force_refresh:
+            cached = price_cache.get("top_movers")
+            if cached:
+                return cached
         try:
             r = session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
             if r.status_code != 200:
@@ -366,11 +365,21 @@ class Binance:
             gainers = sorted_data[:limit]
             losers = sorted_data[-limit:][::-1]
             result = (gainers, losers)
-            price_cache.set("top_movers", result, ttl=30)
+            price_cache.set("top_movers", result, ttl=10)
             return result
         except Exception as e:
             log.error(f"Top movers error: {e}")
             return [], []
+
+    @staticmethod
+    def get_gainers(limit=10, force_refresh=False):
+        g, _ = Binance.top_movers(limit, force_refresh)
+        return g
+
+    @staticmethod
+    def get_losers(limit=10, force_refresh=False):
+        _, l = Binance.top_movers(limit, force_refresh)
+        return l
 
 class CoinGecko:
     COIN_MAP = {
@@ -713,7 +722,7 @@ def _ticker_worker(chat_id, symbol, msg_id, stop_event, key):
                     f"💵 <b>{h(symbol)}</b>  <i>live</i>\n\n"
                     f"{fmt_price(price)}\n"
                     f"{change_str}\n\n"
-                    f"<i>Source: {src} · updates every 3s</i>"
+                    f"<i>Source: {src}</i>"
                 )
             bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
         except ApiTelegramException as e:
@@ -732,29 +741,26 @@ def start_ticker(chat_id, symbol):
     create_ticker(chat_id, symbol, sent.message_id)
 
 # =========================
-# LIVE GAINERS/LOSERS
+# LIVE GAINERS and LIVE LOSERS (no extra description text)
 # =========================
 live_gainers_active = {}
+live_losers_active = {}
 live_gainers_lock = threading.RLock()
+live_losers_lock = threading.RLock()
 
 def _live_gainers_worker(chat_id, msg_id):
     while True:
         with live_gainers_lock:
             if chat_id not in live_gainers_active or not live_gainers_active[chat_id].get("running", False):
                 break
-        gainers, losers = Binance.top_movers()
+        gainers = Binance.get_gainers(limit=10, force_refresh=True)
         if not gainers:
-            text = "❌ Failed to fetch data. Will retry..."
+            text = "❌ Failed to fetch gainers data. Retrying..."
         else:
-            text = "🚀 <b>Live Gainers/Losers (Top 10)</b>\n\n"
-            text += "📈 <b>Top 10 Gainers</b>\n"
+            text = "📈 <b>Live Top 10 Gainers (24h)</b>\n\n"
             for d in gainers:
                 coin = d["symbol"].removesuffix("USDT")
-                text += f"🟢 {coin}  ▲ {float(d['priceChangePercent']):.2f}%\n"
-            text += "\n📉 <b>Top 10 Losers</b>\n"
-            for d in losers:
-                coin = d["symbol"].removesuffix("USDT")
-                text += f"🔴 {coin}  ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
+                text += f"🟢 <b>{h(coin)}</b>  ▲ {float(d['priceChangePercent']):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
         try:
             bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
         except Exception as e:
@@ -766,6 +772,31 @@ def _live_gainers_worker(chat_id, msg_id):
             time.sleep(1)
     with live_gainers_lock:
         live_gainers_active.pop(chat_id, None)
+
+def _live_losers_worker(chat_id, msg_id):
+    while True:
+        with live_losers_lock:
+            if chat_id not in live_losers_active or not live_losers_active[chat_id].get("running", False):
+                break
+        losers = Binance.get_losers(limit=10, force_refresh=True)
+        if not losers:
+            text = "❌ Failed to fetch losers data. Retrying..."
+        else:
+            text = "📉 <b>Live Top 10 Losers (24h)</b>\n\n"
+            for d in losers:
+                coin = d["symbol"].removesuffix("USDT")
+                text += f"🔴 <b>{h(coin)}</b>  ▼ {abs(float(d['priceChangePercent'])):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
+        try:
+            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
+        except Exception as e:
+            log.warning(f"Live losers edit error: {e}")
+        for _ in range(10):
+            with live_losers_lock:
+                if chat_id not in live_losers_active or not live_losers_active[chat_id].get("running", False):
+                    break
+            time.sleep(1)
+    with live_losers_lock:
+        live_losers_active.pop(chat_id, None)
 
 # =========================
 # LIVE MULTI-CURRENCY
@@ -869,13 +900,7 @@ def price_command(m):
         send_and_track(m.chat.id, "Usage: /price <symbol>", back_button())
         return
     symbol = args[1].upper()
-    price, change, src = live_price(symbol)
-    if price is None:
-        text = f"❌ Could not fetch price for {symbol}"
-    else:
-        change_str = f" ({change:+.2f}%)" if change is not None else ""
-        text = f"💰 <b>{symbol}</b>\n{fmt_price(price)}{change_str}\n<i>Source: {src}</i>"
-    send_and_track(m.chat.id, text, back_button())
+    start_ticker(m.chat.id, symbol)
 
 @bot.message_handler(commands=["info"])
 def info_command(m):
@@ -982,21 +1007,13 @@ def main_menu():
     kb = InlineKeyboardMarkup()
     kb.row(InlineKeyboardButton("💰 Price check", callback_data="menu_price"),
            InlineKeyboardButton("🔔 Alert traps", callback_data="menu_alerts"))
-    kb.row(InlineKeyboardButton("📊 Gainers/Losers", callback_data="menu_gainers_losers"),
-           InlineKeyboardButton("🔎 Coin info", callback_data="menu_info"))
-    kb.row(InlineKeyboardButton("💱 Currencies", callback_data="menu_multi"),
-           InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"))
-    kb.row(InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"),
-           InlineKeyboardButton("👤 Profile", callback_data="profile"))
-    return text, kb
-
-def gainers_losers_menu():
-    text = "📊 <b>Gainers & Losers (Top 10)</b>\n\nChoose mode:"
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("🔄 Live (updates every 10s)", callback_data="live_gainers"))
-    kb.row(InlineKeyboardButton("📈 Static top 10", callback_data="gainers"))
-    kb.row(InlineKeyboardButton("📉 Static top 10 losers", callback_data="losers"))
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    kb.row(InlineKeyboardButton("📈 Live Top 10 Gainers", callback_data="live_gainers"),
+           InlineKeyboardButton("📉 Live Top 10 Losers", callback_data="live_losers"))
+    kb.row(InlineKeyboardButton("🔎 Coin info", callback_data="menu_info"),
+           InlineKeyboardButton("💱 Currencies", callback_data="menu_multi"))
+    kb.row(InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"),
+           InlineKeyboardButton("📋 Active alerts", callback_data="list_alerts"))
+    kb.row(InlineKeyboardButton("👤 Profile", callback_data="profile"))
     return text, kb
 
 def price_menu():
@@ -1100,12 +1117,6 @@ def menu_alerts_cb(call):
     send_and_track(call.message.chat.id, text, kb)
     bot.answer_callback_query(call.id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "menu_gainers_losers")
-def menu_gainers_losers_cb(call):
-    text, kb = gainers_losers_menu()
-    send_and_track(call.message.chat.id, text, kb)
-    bot.answer_callback_query(call.id)
-
 @bot.callback_query_handler(func=lambda call: call.data == "menu_scan")
 def menu_scan_cb(call):
     text, kb = scan_menu()
@@ -1128,7 +1139,7 @@ def profile_cb(call):
     send_and_track(call.message.chat.id, text, back_button())
     bot.answer_callback_query(call.id)
 
-# ---------- MODIFIED: Price button starts live ticker ----------
+# Price button starts live ticker
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def price_cb(call):
     symbol = call.data.split("_", 1)[1]
@@ -1222,40 +1233,29 @@ def live_gainers_cb(call):
     with live_gainers_lock:
         if cid in live_gainers_active and live_gainers_active[cid].get("running", False):
             live_gainers_active[cid]["running"] = False
-            send_and_track(cid, "⏹️ Live gainers/losers stopped.", back_button())
+            send_and_track(cid, "⏹️ Live gainers stopped.", back_button())
             bot.answer_callback_query(call.id)
             return
-        text = "🚀 <b>Live Gainers/Losers (updates every 10s, Top 10)</b>\n\nLoading..."
+        text = "📈 <b>Live Top 10 Gainers</b>\n\nLoading..."
         sent = send_and_track(cid, text, back_button())
         live_gainers_active[cid] = {"message_id": sent.message_id, "running": True}
         threading.Thread(target=_live_gainers_worker, args=(cid, sent.message_id), daemon=True).start()
-        bot.answer_callback_query(call.id, "Started live gainers/losers")
+        bot.answer_callback_query(call.id, "Started live gainers")
 
-@bot.callback_query_handler(func=lambda call: call.data == "gainers")
-def static_gainers_cb(call):
-    g, _ = Binance.top_movers()
-    if not g:
-        send_and_track(call.message.chat.id, "🚫 No data right now.", back_button())
-    else:
-        text = "🚀 <b>Top 10 Gainers (24h)</b>\n\n"
-        for d in g:
-            coin = d["symbol"].removesuffix("USDT")
-            text += f"🟢 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▲ {float(d['priceChangePercent']):.2f}%\n"
-        send_and_track(call.message.chat.id, text, back_button())
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "losers")
-def static_losers_cb(call):
-    _, l = Binance.top_movers()
-    if not l:
-        send_and_track(call.message.chat.id, "🚫 No data right now.", back_button())
-    else:
-        text = "📉 <b>Top 10 Losers (24h)</b>\n\n"
-        for d in l:
-            coin = d["symbol"].removesuffix("USDT")
-            text += f"🔴 <b>{h(coin)}</b> — {fmt_price(float(d['lastPrice']))} — ▼ {abs(float(d['priceChangePercent'])):.2f}%\n"
-        send_and_track(call.message.chat.id, text, back_button())
-    bot.answer_callback_query(call.id)
+@bot.callback_query_handler(func=lambda call: call.data == "live_losers")
+def live_losers_cb(call):
+    cid = call.message.chat.id
+    with live_losers_lock:
+        if cid in live_losers_active and live_losers_active[cid].get("running", False):
+            live_losers_active[cid]["running"] = False
+            send_and_track(cid, "⏹️ Live losers stopped.", back_button())
+            bot.answer_callback_query(call.id)
+            return
+        text = "📉 <b>Live Top 10 Losers</b>\n\nLoading..."
+        sent = send_and_track(cid, text, back_button())
+        live_losers_active[cid] = {"message_id": sent.message_id, "running": True}
+        threading.Thread(target=_live_losers_worker, args=(cid, sent.message_id), daemon=True).start()
+        bot.answer_callback_query(call.id, "Started live losers")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("multi_live_"))
 def multi_live_cb(call):
@@ -1284,7 +1284,7 @@ def search_cb(call):
     bot.answer_callback_query(call.id)
 
 # =========================
-# TEXT HANDLER (catch-all)
+# TEXT HANDLER
 # =========================
 @bot.message_handler(func=lambda m: True)
 def text_handler(m):
@@ -1324,7 +1324,6 @@ def text_handler(m):
         mode = state.split("_", 1)[1]
         symbol = m.text.strip().upper()
         if mode == "price":
-            # Search price now starts a live ticker as well
             start_ticker(cid, symbol)
             send_and_track(cid, f"⏳ Starting live ticker for {symbol}...", back_button())
         elif mode == "info":
@@ -1372,6 +1371,9 @@ def stop(sig, frame):
     with live_gainers_lock:
         for chat_id in list(live_gainers_active.keys()):
             live_gainers_active[chat_id]["running"] = False
+    with live_losers_lock:
+        for chat_id in list(live_losers_active.keys()):
+            live_losers_active[chat_id]["running"] = False
     with multi_tickers_lock:
         for chat_id in list(multi_tickers.keys()):
             multi_tickers[chat_id]["running"] = False
@@ -1387,7 +1389,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – Ultimate Edition (live price update for every coin)")
+log.info("🚀 Persona Bot started – live gainers/losers only, no static, no extra text")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
