@@ -1045,7 +1045,7 @@ def info_command(m):
             f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
             f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
             f"📊 24h Volume: {fmt_price(info['volume'])}\n"
-            f"🪙 Circulating Supply: {info['supply']:,.0f}\n"
+            f"🔄 Circulating Supply: {info['supply']:,.0f}\n"
         )
         if info['max_supply']:
             text += f"🔝 Max Supply: {info['max_supply']:,.0f}"
@@ -1289,7 +1289,7 @@ def info_cb(call):
             f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
             f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
             f"📊 24h Volume: {fmt_price(info['volume'])}\n"
-            f"🪙 Circulating Supply: {info['supply']:,.0f}\n"
+            f"🔄 Circulating Supply: {info['supply']:,.0f}\n"
         )
         if info['max_supply']:
             text += f"🔝 Max Supply: {info['max_supply']:,.0f}"
@@ -1473,7 +1473,7 @@ def text_handler(m):
                     f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
                     f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
                     f"📊 24h Volume: {fmt_price(info['volume'])}\n"
-                    f🪙 Circulating Supply: {info['supply']:,.0f}\n"
+                    f"🔄 Circulating Supply: {info['supply']:,.0f}\n"
                 )
                 if info['max_supply']:
                     text += f"🔝 Max Supply: {info['max_supply']:,.0f}"
