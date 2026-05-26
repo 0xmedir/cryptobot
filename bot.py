@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Persona Bot – Ultimate Edition
-- Live Top 10 Gainers (updates every 10s) – no extra text
-- Live Top 10 Losers (updates every 10s) – no extra text
-- No static gainers/losers
-- Price menu: every coin starts a live ticker
-- Multi‑currency live ticker
-- Wallet checker removed
+- Live Top 10 Gainers / Losers (updates every 10s)
+- Price menu: live ticker for every coin
+- Multi‑currency live ticker (updates every 3s, no cache)
+- Deletes last 5 bot messages + user commands
+- Profile: no "Interactions" line
+- Admin commands, maintenance mode, alerts, scanner
 """
 
 import telebot
@@ -45,7 +45,7 @@ COOLDOWN_SECONDS = 2
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
 MAX_TEXT_LEN = 200
-MAX_HISTORY = 3
+MAX_HISTORY = 5
 MAX_LIVE_TICKERS = 50
 MAINTENANCE_SPAM_COOLDOWN = 60
 
@@ -176,7 +176,7 @@ class TTLCache:
 
 price_cache = TTLCache(3)
 coin_cache = TTLCache(3600)
-multi_cache = TTLCache(10)
+multi_cache = TTLCache(0)           # no caching for multi‑price
 
 # =========================
 # REQUEST SESSION
@@ -236,6 +236,12 @@ def fmt_currency_value(currency_code, value):
 
 def safe_first_200(text):
     return (text or "")[:200]
+
+def delete_user_message(m):
+    try:
+        bot.delete_message(m.chat.id, m.message_id)
+    except Exception:
+        pass
 
 # =========================
 # MAINTENANCE MODE
@@ -448,10 +454,11 @@ class CoinGecko:
             return None
 
     @staticmethod
-    def multi_price(symbol):
-        cached = multi_cache.get(f"multi_{symbol}")
-        if cached:
-            return cached
+    def multi_price(symbol, force_refresh=False):
+        if not force_refresh:
+            cached = multi_cache.get(f"multi_{symbol}")
+            if cached:
+                return cached
         coin_id = CoinGecko.resolve_id(symbol)
         if not coin_id:
             return None
@@ -465,7 +472,7 @@ class CoinGecko:
             if r.status_code != 200:
                 return None
             data = r.json().get(coin_id)
-            if data:
+            if data and not force_refresh:
                 multi_cache.set(f"multi_{symbol}", data, ttl=10)
             return data
         except Exception as e:
@@ -741,7 +748,7 @@ def start_ticker(chat_id, symbol):
     create_ticker(chat_id, symbol, sent.message_id)
 
 # =========================
-# LIVE GAINERS and LIVE LOSERS (no extra description text)
+# LIVE GAINERS and LIVE LOSERS
 # =========================
 live_gainers_active = {}
 live_losers_active = {}
@@ -799,7 +806,7 @@ def _live_losers_worker(chat_id, msg_id):
         live_losers_active.pop(chat_id, None)
 
 # =========================
-# LIVE MULTI-CURRENCY
+# LIVE MULTI-CURRENCY (updates every 3s, no cache)
 # =========================
 multi_tickers = {}
 multi_tickers_lock = threading.RLock()
@@ -816,7 +823,7 @@ def _live_multi_worker(chat_id, symbol, msg_id):
             if chat_id not in multi_tickers or not multi_tickers[chat_id].get("running", False):
                 break
             current_symbol = multi_tickers[chat_id]["symbol"]
-        prices = CoinGecko.multi_price(current_symbol)
+        prices = CoinGecko.multi_price(current_symbol, force_refresh=True)
         if not prices:
             text = f"❌ Failed to fetch data for {current_symbol}"
         else:
@@ -844,6 +851,7 @@ def _live_multi_worker(chat_id, symbol, msg_id):
 def broadcast_cmd(m):
     if not is_admin(m.from_user.id):
         return
+    delete_user_message(m)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
         bot.reply_to(m, "Usage: /broadcast <message>")
@@ -856,6 +864,7 @@ def broadcast_cmd(m):
 def maintenance_cmd(m):
     if not is_admin(m.from_user.id):
         return
+    delete_user_message(m)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
         active, msg = get_maintenance()
@@ -875,6 +884,7 @@ def maintenance_cmd(m):
 def stats_cmd(m):
     if not is_admin(m.from_user.id):
         return
+    delete_user_message(m)
     total_users = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
     total_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
     total_triggers = db_query("SELECT SUM(alerts_triggered) FROM profiles", fetch_one=True)[0] or 0
@@ -887,6 +897,7 @@ def stats_cmd(m):
 def start(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
+    delete_user_message(m)
     log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
     text, kb = main_menu()
     send_and_track(m.chat.id, text, kb)
@@ -895,6 +906,7 @@ def start(m):
 def price_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
+    delete_user_message(m)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /price <symbol>", back_button())
@@ -906,6 +918,7 @@ def price_command(m):
 def info_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
+    delete_user_message(m)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /info <symbol>", back_button())
@@ -933,6 +946,7 @@ def info_command(m):
 def live_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
+    delete_user_message(m)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /live <symbol>", back_button())
@@ -944,6 +958,7 @@ def live_command(m):
 def alert_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
+    delete_user_message(m)
     text, kb = alerts_menu()
     send_and_track(m.chat.id, text, kb)
 
@@ -951,6 +966,7 @@ def alert_command(m):
 def scan_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
+    delete_user_message(m)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /scan <contract_address>", back_button())
@@ -1127,11 +1143,11 @@ def menu_scan_cb(call):
 def profile_cb(call):
     uid = call.from_user.id
     p = get_profile(uid)
+    # Removed "Interactions" line
     text = (
         f"👤 <b>Your Profile</b>\n\n"
         f"User ID: {p['user_id']}\n"
         f"Joined: {time.strftime('%Y-%m-%d', time.localtime(p['join_date']))}\n"
-        f"Interactions: {p['total_interactions']}\n"
         f"Alerts set: {p['alerts_set']}\n"
         f"Alerts triggered: {p['alerts_triggered']}\n"
         f"Active alerts: {get_alert_count(uid)}"
@@ -1389,7 +1405,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – live gainers/losers only, no static, no extra text")
+log.info("🚀 Persona Bot started – profile without interactions, live updates, 5‑message history")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
