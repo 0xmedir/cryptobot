@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Fully Fixed (instant live updates, no Etherscan key)
-- Live Top 10 Gainers / Losers (updates every 10s, never hangs)
-- Live price tickers for any coin (updates every 3s)
+Persona Bot – Final Production Version
+- Live Top 10 Gainers / Losers (instant, updates every 10s)
+- Live price ticker for any coin (updates every 3s)
 - Live multi‑currency prices (updates every 3s)
 - Price alerts (preset + custom)
 - Contract scanner (GoPlusLabs)
-- User profile (without interactions count)
+- User profile (join date, alerts set/triggered)
 - Admin commands (/broadcast, /maintenance, /stats)
-- Deletes last 5 bot messages + user commands
 - Maintenance mode
+- Auto‑delete last 5 bot messages + user commands
+- WebSocket for real‑time price feeds
+- No Etherscan API key required
 """
 
 import telebot
@@ -745,7 +747,7 @@ def _ticker_worker(chat_id, symbol, msg_id, stop_event, key):
                     f"<i>Source: {src}</i>"
                 )
             if not safe_edit(chat_id, msg_id, text, back_button()):
-                break  # message deleted or unrecoverable
+                break
         except Exception as e:
             log.warning(f"Ticker edit error ({key}): {e}")
         stop_event.wait(timeout=3)
@@ -759,7 +761,7 @@ def start_ticker(chat_id, symbol):
         create_ticker(chat_id, symbol, sent.message_id)
 
 # =========================
-# LIVE GAINERS (INSTANT)
+# LIVE GAINERS (instant)
 # =========================
 live_gainers_active = {}
 live_losers_active = {}
@@ -767,7 +769,6 @@ live_gainers_lock = threading.RLock()
 live_losers_lock = threading.RLock()
 
 def _live_gainers_worker(chat_id, msg_id):
-    # First fetch immediately
     try:
         gainers = Binance.get_gainers(limit=10, force_refresh=True)
         if gainers:
@@ -785,7 +786,6 @@ def _live_gainers_worker(chat_id, msg_id):
             live_gainers_active.pop(chat_id, None)
         return
 
-    # Then loop every 10 seconds
     while True:
         with live_gainers_lock:
             if chat_id not in live_gainers_active or not live_gainers_active[chat_id].get("running", False):
@@ -803,7 +803,6 @@ def _live_gainers_worker(chat_id, msg_id):
                 break
         except Exception as e:
             log.error(f"Gainers update error: {e}")
-        # Wait 10 seconds, check stop signal every second
         for _ in range(10):
             with live_gainers_lock:
                 if chat_id not in live_gainers_active or not live_gainers_active[chat_id].get("running", False):
@@ -1300,6 +1299,11 @@ def list_alerts_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_alert_"))
 def cancel_alert_cb(call):
     alert_id = int(call.data.split("_")[-1])
+    # Security check: ensure the user owns the alert
+    row = db_query("SELECT user_id FROM alerts WHERE id=?", (alert_id,), fetch_one=True)
+    if not row or row[0] != call.from_user.id:
+        bot.answer_callback_query(call.id, "Not your alert")
+        return
     deactivate_alert(alert_id)
     send_and_track(call.message.chat.id, "✅ Alert cancelled.", back_button())
     bot.answer_callback_query(call.id)
@@ -1313,7 +1317,6 @@ def live_gainers_cb(call):
             send_and_track(cid, "⏹️ Live gainers stopped.", back_button())
             bot.answer_callback_query(call.id)
             return
-        # Send initial "Fetching..." message
         init_msg = safe_send(cid, "📈 Fetching top 10 gainers...", back_button())
         if not init_msg:
             bot.answer_callback_query(call.id, "Failed to start. Try again.")
@@ -1470,7 +1473,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – fully fixed, instant live updates")
+log.info("🚀 Persona Bot started – fully fixed production version")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
