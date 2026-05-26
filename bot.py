@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Ultimate Edition
-- Live Top 10 Gainers / Losers (updates every 10s)
+Persona Bot – Final Fixed Version
+- Live Top 10 Gainers / Losers (updates every 10s, no loading hang)
 - Price menu: live ticker for every coin
-- Multi‑currency live ticker (updates every 3s, no cache)
+- Multi‑currency live ticker (updates every 3s)
 - Deletes last 5 bot messages + user commands
 - Profile: no "Interactions" line
 - Admin commands, maintenance mode, alerts, scanner
+- WebSocket auto-reconnect
 """
 
 import telebot
@@ -351,6 +352,7 @@ class Binance:
 
     @staticmethod
     def top_movers(limit=10, force_refresh=False):
+        # No caching for live mode; force_refresh bypasses cache
         if not force_refresh:
             cached = price_cache.get("top_movers")
             if cached:
@@ -371,7 +373,7 @@ class Binance:
             gainers = sorted_data[:limit]
             losers = sorted_data[-limit:][::-1]
             result = (gainers, losers)
-            price_cache.set("top_movers", result, ttl=10)
+            price_cache.set("top_movers", result, ttl=10)  # cache for static requests
             return result
         except Exception as e:
             log.error(f"Top movers error: {e}")
@@ -748,7 +750,7 @@ def start_ticker(chat_id, symbol):
     create_ticker(chat_id, symbol, sent.message_id)
 
 # =========================
-# LIVE GAINERS and LIVE LOSERS
+# LIVE GAINERS and LIVE LOSERS (fixed threading)
 # =========================
 live_gainers_active = {}
 live_losers_active = {}
@@ -756,22 +758,27 @@ live_gainers_lock = threading.RLock()
 live_losers_lock = threading.RLock()
 
 def _live_gainers_worker(chat_id, msg_id):
+    # Give the main thread a moment to store the active entry
+    time.sleep(0.5)
     while True:
+        # Check if still active
         with live_gainers_lock:
             if chat_id not in live_gainers_active or not live_gainers_active[chat_id].get("running", False):
+                log.info(f"Stopping live gainers for chat {chat_id}")
                 break
-        gainers = Binance.get_gainers(limit=10, force_refresh=True)
-        if not gainers:
-            text = "❌ Failed to fetch gainers data. Retrying..."
-        else:
-            text = "📈 <b>Live Top 10 Gainers (24h)</b>\n\n"
-            for d in gainers:
-                coin = d["symbol"].removesuffix("USDT")
-                text += f"🟢 <b>{h(coin)}</b>  ▲ {float(d['priceChangePercent']):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
         try:
+            gainers = Binance.get_gainers(limit=10, force_refresh=True)
+            if not gainers:
+                text = "❌ Failed to fetch gainers data. Retrying..."
+            else:
+                text = "📈 <b>Live Top 10 Gainers (24h)</b>\n\n"
+                for d in gainers:
+                    coin = d["symbol"].removesuffix("USDT")
+                    text += f"🟢 <b>{h(coin)}</b>  ▲ {float(d['priceChangePercent']):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
             bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
         except Exception as e:
-            log.warning(f"Live gainers edit error: {e}")
+            log.error(f"Live gainers update error: {e}")
+        # Wait 10 seconds before next update, checking for stop signal every second
         for _ in range(10):
             with live_gainers_lock:
                 if chat_id not in live_gainers_active or not live_gainers_active[chat_id].get("running", False):
@@ -781,22 +788,24 @@ def _live_gainers_worker(chat_id, msg_id):
         live_gainers_active.pop(chat_id, None)
 
 def _live_losers_worker(chat_id, msg_id):
+    time.sleep(0.5)
     while True:
         with live_losers_lock:
             if chat_id not in live_losers_active or not live_losers_active[chat_id].get("running", False):
+                log.info(f"Stopping live losers for chat {chat_id}")
                 break
-        losers = Binance.get_losers(limit=10, force_refresh=True)
-        if not losers:
-            text = "❌ Failed to fetch losers data. Retrying..."
-        else:
-            text = "📉 <b>Live Top 10 Losers (24h)</b>\n\n"
-            for d in losers:
-                coin = d["symbol"].removesuffix("USDT")
-                text += f"🔴 <b>{h(coin)}</b>  ▼ {abs(float(d['priceChangePercent'])):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
         try:
+            losers = Binance.get_losers(limit=10, force_refresh=True)
+            if not losers:
+                text = "❌ Failed to fetch losers data. Retrying..."
+            else:
+                text = "📉 <b>Live Top 10 Losers (24h)</b>\n\n"
+                for d in losers:
+                    coin = d["symbol"].removesuffix("USDT")
+                    text += f"🔴 <b>{h(coin)}</b>  ▼ {abs(float(d['priceChangePercent'])):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
             bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
         except Exception as e:
-            log.warning(f"Live losers edit error: {e}")
+            log.error(f"Live losers update error: {e}")
         for _ in range(10):
             with live_losers_lock:
                 if chat_id not in live_losers_active or not live_losers_active[chat_id].get("running", False):
@@ -1405,7 +1414,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – profile without interactions, live updates, 5‑message history")
+log.info("🚀 Persona Bot started – fully fixed, live gainers/losers working, profile without interactions")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
