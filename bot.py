@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final Fixed Version
-- Live Top 10 Gainers / Losers (updates every 10s, no loading hang)
-- Price menu: live ticker for every coin
-- Multi‑currency live ticker (updates every 3s)
-- Deletes last 5 bot messages + user commands
-- Profile: no "Interactions" line
-- Admin commands, maintenance mode, alerts, scanner
-- WebSocket auto-reconnect
+Persona Bot – Fully Fixed (No Etherscan API key required)
 """
 
 import telebot
@@ -34,11 +27,6 @@ import websocket
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN environment variable not set")
-    sys.exit(1)
-
-ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY")
-if not ETHERSCAN_API_KEY:
-    print("❌ ETHERSCAN_API_KEY environment variable not set")
     sys.exit(1)
 
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "7458428092").split(",") if x.strip()]
@@ -177,7 +165,7 @@ class TTLCache:
 
 price_cache = TTLCache(3)
 coin_cache = TTLCache(3600)
-multi_cache = TTLCache(0)           # no caching for multi‑price
+multi_cache = TTLCache(0)
 
 # =========================
 # REQUEST SESSION
@@ -239,10 +227,36 @@ def safe_first_200(text):
     return (text or "")[:200]
 
 def delete_user_message(m):
+    """Safely delete user's command message; ignore any errors."""
     try:
         bot.delete_message(m.chat.id, m.message_id)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"Could not delete message: {e}")
+
+def safe_send(chat_id, text, markup=None):
+    """Send message with exception catching. parse_mode uses bot default (HTML)."""
+    try:
+        return bot.send_message(chat_id, text, reply_markup=markup, disable_web_page_preview=True)
+    except ApiTelegramException as e:
+        log.error(f"Telegram API error sending to {chat_id}: {e}")
+        return None
+    except Exception as e:
+        log.error(f"Unexpected error sending to {chat_id}: {e}")
+        return None
+
+def safe_edit(chat_id, msg_id, text, markup=None):
+    """Edit message, silently ignoring 'not modified' errors."""
+    try:
+        bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return True
+    except ApiTelegramException as e:
+        if "message is not modified" in str(e):
+            return True  # not a real error
+        log.warning(f"Failed to edit message {msg_id} in {chat_id}: {e}")
+        return False
+    except Exception as e:
+        log.warning(f"Unexpected edit error: {e}")
+        return False
 
 # =========================
 # MAINTENANCE MODE
@@ -268,12 +282,7 @@ def maintenance_block(uid, cid):
     if now - last < MAINTENANCE_SPAM_COOLDOWN:
         return True
     maintenance_spam[cid] = now
-    bot.send_message(
-        cid,
-        "🔧 <b>Bot Under Maintenance</b>\n\n"
-        + (h(msg) if msg else "We'll be back shortly. Thank you for your patience."),
-        disable_web_page_preview=True,
-    )
+    safe_send(cid, "🔧 <b>Bot Under Maintenance</b>\n\n" + (h(msg) if msg else "We'll be back shortly. Thank you for your patience."))
     return True
 
 def broadcast_all(text, skip_uid=None):
@@ -282,13 +291,12 @@ def broadcast_all(text, skip_uid=None):
     for (uid,) in rows:
         if skip_uid and uid == skip_uid:
             continue
-        try:
-            bot.send_message(uid, text)
+        result = safe_send(uid, text)
+        if result:
             sent += 1
-            time.sleep(0.05)
-        except Exception as e:
-            log.error(f"broadcast_all failed for {uid}: {e}")
+        else:
             failed += 1
+        time.sleep(0.05)
     return sent, failed
 
 # =========================
@@ -352,7 +360,6 @@ class Binance:
 
     @staticmethod
     def top_movers(limit=10, force_refresh=False):
-        # No caching for live mode; force_refresh bypasses cache
         if not force_refresh:
             cached = price_cache.get("top_movers")
             if cached:
@@ -373,7 +380,7 @@ class Binance:
             gainers = sorted_data[:limit]
             losers = sorted_data[-limit:][::-1]
             result = (gainers, losers)
-            price_cache.set("top_movers", result, ttl=10)  # cache for static requests
+            price_cache.set("top_movers", result, ttl=10)
             return result
         except Exception as e:
             log.error(f"Top movers error: {e}")
@@ -641,15 +648,18 @@ def alert_loop():
                       (a["direction"] == "<" and price <= a["target"])
                 if not hit:
                     continue
-                deactivate_alert(a["id"])
-                last_trigger[key] = now
-                db_query("UPDATE profiles SET alerts_triggered = alerts_triggered + 1 WHERE user_id=?", (a["user_id"],))
-                bot.send_message(
+                sent = safe_send(
                     a["chat_id"],
                     f"🚨 <b>PRICE ALERT TRIGGERED</b>\n\n"
                     f"<b>{h(a['coin'])}</b> {h(a['direction'])} <b>{a['target']:,.2f}</b>\n"
                     f"💵 Current: <b>{fmt_price(price)}</b>",
                 )
+                if sent:
+                    deactivate_alert(a["id"])
+                    last_trigger[key] = now
+                    db_query("UPDATE profiles SET alerts_triggered = alerts_triggered + 1 WHERE user_id=?", (a["user_id"],))
+                else:
+                    log.warning(f"Alert {a['id']} notification failed; keeping active to retry.")
         except Exception as e:
             log.error(f"Alert loop error: {e}")
         time.sleep(5)
@@ -663,7 +673,9 @@ msg_queue = {}
 q_lock = threading.RLock()
 
 def send_and_track(chat_id, text, markup=None):
-    sent = bot.send_message(chat_id, text, reply_markup=markup, disable_web_page_preview=True)
+    sent = safe_send(chat_id, text, markup)
+    if sent is None:
+        return None
     with q_lock:
         if chat_id not in msg_queue:
             msg_queue[chat_id] = []
@@ -695,7 +707,7 @@ def create_ticker(chat_id, symbol, message_id):
     stop_event = threading.Event()
     with tickers_lock:
         if len(tickers) >= MAX_LIVE_TICKERS:
-            bot.send_message(chat_id, "🚫 Too many active tickers. Please wait.")
+            safe_send(chat_id, "🚫 Too many active tickers. Please wait.")
             return None
         tickers[key] = stop_event
     thread = threading.Thread(target=_ticker_worker, args=(chat_id, symbol, message_id, stop_event, key), daemon=True)
@@ -733,11 +745,7 @@ def _ticker_worker(chat_id, symbol, msg_id, stop_event, key):
                     f"{change_str}\n\n"
                     f"<i>Source: {src}</i>"
                 )
-            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
-        except ApiTelegramException as e:
-            if "message is not modified" not in str(e):
-                log.warning(f"Ticker edit fatal ({key}): {e}")
-                break
+            safe_edit(chat_id, msg_id, text, back_button())
         except Exception as e:
             log.warning(f"Ticker edit error ({key}): {e}")
         stop_event.wait(timeout=3)
@@ -747,10 +755,11 @@ def _ticker_worker(chat_id, symbol, msg_id, stop_event, key):
 
 def start_ticker(chat_id, symbol):
     sent = send_and_track(chat_id, f"⏳ Starting live ticker for {symbol}...", back_button())
-    create_ticker(chat_id, symbol, sent.message_id)
+    if sent:
+        create_ticker(chat_id, symbol, sent.message_id)
 
 # =========================
-# LIVE GAINERS and LIVE LOSERS (fixed threading)
+# LIVE GAINERS and LIVE LOSERS
 # =========================
 live_gainers_active = {}
 live_losers_active = {}
@@ -758,10 +767,8 @@ live_gainers_lock = threading.RLock()
 live_losers_lock = threading.RLock()
 
 def _live_gainers_worker(chat_id, msg_id):
-    # Give the main thread a moment to store the active entry
     time.sleep(0.5)
     while True:
-        # Check if still active
         with live_gainers_lock:
             if chat_id not in live_gainers_active or not live_gainers_active[chat_id].get("running", False):
                 log.info(f"Stopping live gainers for chat {chat_id}")
@@ -775,10 +782,9 @@ def _live_gainers_worker(chat_id, msg_id):
                 for d in gainers:
                     coin = d["symbol"].removesuffix("USDT")
                     text += f"🟢 <b>{h(coin)}</b>  ▲ {float(d['priceChangePercent']):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
-            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
+            safe_edit(chat_id, msg_id, text, back_button())
         except Exception as e:
             log.error(f"Live gainers update error: {e}")
-        # Wait 10 seconds before next update, checking for stop signal every second
         for _ in range(10):
             with live_gainers_lock:
                 if chat_id not in live_gainers_active or not live_gainers_active[chat_id].get("running", False):
@@ -803,7 +809,7 @@ def _live_losers_worker(chat_id, msg_id):
                 for d in losers:
                     coin = d["symbol"].removesuffix("USDT")
                     text += f"🔴 <b>{h(coin)}</b>  ▼ {abs(float(d['priceChangePercent'])):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
-            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
+            safe_edit(chat_id, msg_id, text, back_button())
         except Exception as e:
             log.error(f"Live losers update error: {e}")
         for _ in range(10):
@@ -815,7 +821,7 @@ def _live_losers_worker(chat_id, msg_id):
         live_losers_active.pop(chat_id, None)
 
 # =========================
-# LIVE MULTI-CURRENCY (updates every 3s, no cache)
+# LIVE MULTI-CURRENCY
 # =========================
 multi_tickers = {}
 multi_tickers_lock = threading.RLock()
@@ -841,10 +847,7 @@ def _live_multi_worker(chat_id, symbol, msg_id):
                 val = prices.get(key)
                 if val is not None:
                     text += f"{flag}: <b>{h(fmt_currency_value(key, val))}</b>\n"
-        try:
-            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=back_button())
-        except Exception as e:
-            log.warning(f"Live multi edit error: {e}")
+        safe_edit(chat_id, msg_id, text, back_button())
         for _ in range(3):
             with multi_tickers_lock:
                 if chat_id not in multi_tickers or not multi_tickers[chat_id].get("running", False):
@@ -863,11 +866,11 @@ def broadcast_cmd(m):
     delete_user_message(m)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
-        bot.reply_to(m, "Usage: /broadcast <message>")
+        safe_send(m.chat.id, "Usage: /broadcast <message>")
         return
     msg = args[1]
     sent, failed = broadcast_all(msg, skip_uid=m.from_user.id)
-    bot.reply_to(m, f"Broadcast sent to {sent} users. Failed: {failed}")
+    safe_send(m.chat.id, f"Broadcast sent to {sent} users. Failed: {failed}")
 
 @bot.message_handler(commands=["maintenance"])
 def maintenance_cmd(m):
@@ -877,17 +880,17 @@ def maintenance_cmd(m):
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
         active, msg = get_maintenance()
-        bot.reply_to(m, f"Maintenance mode: {'ON' if active else 'OFF'}\nMessage: {msg}")
+        safe_send(m.chat.id, f"Maintenance mode: {'ON' if active else 'OFF'}\nMessage: {msg}")
         return
     sub = args[1].lower()
     if sub == "on":
         set_maintenance(True, "Bot is under maintenance. Please try again later.")
-        bot.reply_to(m, "✅ Maintenance mode ENABLED. Use /maintenance off to disable.")
+        safe_send(m.chat.id, "✅ Maintenance mode ENABLED. Use /maintenance off to disable.")
     elif sub == "off":
         set_maintenance(False)
-        bot.reply_to(m, "✅ Maintenance mode DISABLED.")
+        safe_send(m.chat.id, "✅ Maintenance mode DISABLED.")
     else:
-        bot.reply_to(m, "Usage: /maintenance on|off")
+        safe_send(m.chat.id, "Usage: /maintenance on|off")
 
 @bot.message_handler(commands=["stats"])
 def stats_cmd(m):
@@ -897,7 +900,7 @@ def stats_cmd(m):
     total_users = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
     total_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
     total_triggers = db_query("SELECT SUM(alerts_triggered) FROM profiles", fetch_one=True)[0] or 0
-    bot.reply_to(m, f"📊 <b>Bot Stats</b>\n\nUsers: {total_users}\nActive alerts: {total_alerts}\nTotal triggers: {total_triggers}", parse_mode="HTML")
+    safe_send(m.chat.id, f"📊 <b>Bot Stats</b>\n\nUsers: {total_users}\nActive alerts: {total_alerts}\nTotal triggers: {total_triggers}")
 
 # =========================
 # COMMAND HANDLERS
@@ -910,6 +913,16 @@ def start(m):
     log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
     text, kb = main_menu()
     send_and_track(m.chat.id, text, kb)
+
+@bot.message_handler(commands=["cancel"])
+def cancel_cmd(m):
+    delete_user_message(m)
+    cid = m.chat.id
+    uid = m.from_user.id
+    with wait_lock:
+        had_state = waiting.pop((cid, uid), None)
+    if had_state:
+        send_and_track(cid, "❌ Cancelled.", back_button())
 
 @bot.message_handler(commands=["price"])
 def price_command(m):
@@ -1152,7 +1165,6 @@ def menu_scan_cb(call):
 def profile_cb(call):
     uid = call.from_user.id
     p = get_profile(uid)
-    # Removed "Interactions" line
     text = (
         f"👤 <b>Your Profile</b>\n\n"
         f"User ID: {p['user_id']}\n"
@@ -1164,7 +1176,6 @@ def profile_cb(call):
     send_and_track(call.message.chat.id, text, back_button())
     bot.answer_callback_query(call.id)
 
-# Price button starts live ticker
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def price_cb(call):
     symbol = call.data.split("_", 1)[1]
@@ -1263,8 +1274,9 @@ def live_gainers_cb(call):
             return
         text = "📈 <b>Live Top 10 Gainers</b>\n\nLoading..."
         sent = send_and_track(cid, text, back_button())
-        live_gainers_active[cid] = {"message_id": sent.message_id, "running": True}
-        threading.Thread(target=_live_gainers_worker, args=(cid, sent.message_id), daemon=True).start()
+        if sent:
+            live_gainers_active[cid] = {"message_id": sent.message_id, "running": True}
+            threading.Thread(target=_live_gainers_worker, args=(cid, sent.message_id), daemon=True).start()
         bot.answer_callback_query(call.id, "Started live gainers")
 
 @bot.callback_query_handler(func=lambda call: call.data == "live_losers")
@@ -1278,8 +1290,9 @@ def live_losers_cb(call):
             return
         text = "📉 <b>Live Top 10 Losers</b>\n\nLoading..."
         sent = send_and_track(cid, text, back_button())
-        live_losers_active[cid] = {"message_id": sent.message_id, "running": True}
-        threading.Thread(target=_live_losers_worker, args=(cid, sent.message_id), daemon=True).start()
+        if sent:
+            live_losers_active[cid] = {"message_id": sent.message_id, "running": True}
+            threading.Thread(target=_live_losers_worker, args=(cid, sent.message_id), daemon=True).start()
         bot.answer_callback_query(call.id, "Started live losers")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("multi_live_"))
@@ -1294,8 +1307,9 @@ def multi_live_cb(call):
             return
         text = f"💱 <b>{symbol} – Currencies (live)</b>\n\nLoading..."
         sent = send_and_track(cid, text, back_button())
-        multi_tickers[cid] = {"symbol": symbol, "message_id": sent.message_id, "running": True}
-        threading.Thread(target=_live_multi_worker, args=(cid, symbol, sent.message_id), daemon=True).start()
+        if sent:
+            multi_tickers[cid] = {"symbol": symbol, "message_id": sent.message_id, "running": True}
+            threading.Thread(target=_live_multi_worker, args=(cid, symbol, sent.message_id), daemon=True).start()
         bot.answer_callback_query(call.id, f"Live multi‑currency for {symbol} started")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
@@ -1322,9 +1336,7 @@ def text_handler(m):
     if not state:
         return
 
-    if m.text.lower() == "/cancel":
-        send_and_track(cid, "❌ Cancelled.", back_button())
-        return
+    delete_user_message(m)
 
     if state == "custom_alert":
         pattern = r"^(\w+)\s*([<>])\s*([\d.]+)$"
@@ -1350,7 +1362,6 @@ def text_handler(m):
         symbol = m.text.strip().upper()
         if mode == "price":
             start_ticker(cid, symbol)
-            send_and_track(cid, f"⏳ Starting live ticker for {symbol}...", back_button())
         elif mode == "info":
             info = CoinGecko.info(symbol)
             if not info:
@@ -1381,8 +1392,9 @@ def start_live_multi(chat_id, symbol):
             return
         text = f"💱 <b>{symbol} – Currencies (live)</b>\n\nLoading..."
         sent = send_and_track(chat_id, text, back_button())
-        multi_tickers[chat_id] = {"symbol": symbol, "message_id": sent.message_id, "running": True}
-        threading.Thread(target=_live_multi_worker, args=(chat_id, symbol, sent.message_id), daemon=True).start()
+        if sent:
+            multi_tickers[chat_id] = {"symbol": symbol, "message_id": sent.message_id, "running": True}
+            threading.Thread(target=_live_multi_worker, args=(chat_id, symbol, sent.message_id), daemon=True).start()
 
 # =========================
 # SHUTDOWN
@@ -1414,7 +1426,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – fully fixed, live gainers/losers working, profile without interactions")
+log.info("🚀 Persona Bot started – no Etherscan API key required")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
