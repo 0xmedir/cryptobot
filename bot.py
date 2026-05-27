@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Chat History Version
-- Keeps last 5 bot messages and last 3 user commands
-- Auto‑deletes older messages to maintain clean Q&A flow
-- No live updates, no editing
-- /users shows only names, usernames, join dates
+Persona Bot – Last 5 Messages Only (combined user + bot)
+- Keeps the most recent 5 messages in the chat.
+- Deletes the oldest message when a 6th arrives.
+- No instant deletion – your commands stay visible until they fall out of the 5-message window.
+- All features: price, info, gainers, losers, multi, alerts, scan, profile, admin commands.
 """
 
 import telebot
@@ -35,10 +35,7 @@ if not BOT_TOKEN:
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "7458428092").split(",") if x.strip()]
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
-
-# History limits
-MAX_BOT_MESSAGES = 5   # keep last 5 bot messages
-MAX_USER_COMMANDS = 3  # keep last 3 user commands
+MAX_CHAT_MESSAGES = 5  # Keep only the last 5 messages per chat
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("PersonaBot")
@@ -150,7 +147,7 @@ retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503,
 adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
-session.headers.update({"User-Agent": "PersonaBot/Static/3.0"})
+session.headers.update({"User-Agent": "PersonaBot/Static/4.0"})
 
 # =========================
 # HELPERS
@@ -429,58 +426,39 @@ def maintenance_block(uid, cid):
     return True
 
 # =========================
-# MESSAGE HISTORY MANAGER (Q&A flow)
+# MESSAGE QUEUE – KEEP LAST 5 MESSAGES (combined)
 # =========================
-# Store per chat: list of user message IDs (commands) and bot message IDs
-user_msg_queues = {}
-bot_msg_queues = {}
-history_lock = threading.RLock()
+message_queues = {}  # chat_id -> list of message_ids (FIFO)
+queue_lock = threading.RLock()
 
-def add_user_message(chat_id, msg_id):
-    """Add a user command message ID, keep last MAX_USER_COMMANDS, delete oldest if exceeded."""
-    with history_lock:
-        if chat_id not in user_msg_queues:
-            user_msg_queues[chat_id] = []
-        queue = user_msg_queues[chat_id]
-        queue.append(msg_id)
-        while len(queue) > MAX_USER_COMMANDS:
-            old = queue.pop(0)
+def track_message(chat_id, message_id):
+    """Add message_id to the queue. If queue exceeds MAX_CHAT_MESSAGES, delete the oldest."""
+    with queue_lock:
+        if chat_id not in message_queues:
+            message_queues[chat_id] = []
+        queue = message_queues[chat_id]
+        queue.append(message_id)
+        while len(queue) > MAX_CHAT_MESSAGES:
+            oldest = queue.pop(0)
             try:
-                bot.delete_message(chat_id, old)
+                bot.delete_message(chat_id, oldest)
             except Exception as e:
-                log.warning(f"Failed to delete user message {old}: {e}")
+                log.warning(f"Failed to delete message {oldest} in chat {chat_id}: {e}")
 
-def add_bot_message(chat_id, msg_id):
-    """Add a bot message ID, keep last MAX_BOT_MESSAGES, delete oldest if exceeded."""
-    with history_lock:
-        if chat_id not in bot_msg_queues:
-            bot_msg_queues[chat_id] = []
-        queue = bot_msg_queues[chat_id]
-        queue.append(msg_id)
-        while len(queue) > MAX_BOT_MESSAGES:
-            old = queue.pop(0)
-            try:
-                bot.delete_message(chat_id, old)
-            except Exception as e:
-                log.warning(f"Failed to delete bot message {old}: {e}")
-
-def clear_old_button_message(chat_id, msg_id):
-    """Delete a single message (used for inline keyboard messages that are replaced)."""
+def clear_old_button_message(chat_id, message_id):
+    """Delete a button message immediately (it will be replaced by a new menu)."""
     try:
-        bot.delete_message(chat_id, msg_id)
+        bot.delete_message(chat_id, message_id)
     except Exception:
         pass
+    # Also remove from queue if present? But it's already being deleted; we don't want to track it.
+    # We'll just leave it – it's gone.
 
-def send_and_track(chat_id, text, markup=None, is_bot=True):
-    """Send a new message and track it in the appropriate queue."""
+def send_and_track(chat_id, text, markup=None):
+    """Send a new message, then track it."""
     sent = safe_send(chat_id, text, markup)
-    if sent is None:
-        return None
-    if is_bot:
-        add_bot_message(chat_id, sent.message_id)
-    else:
-        # This would be for user messages, but we call add_user_message separately.
-        pass
+    if sent:
+        track_message(chat_id, sent.message_id)
     return sent
 
 def back_button():
@@ -495,8 +473,7 @@ def back_button():
 def users_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    # Track user command
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)  # track user command
     rows = db_query("SELECT username, first_name, join_date FROM profiles ORDER BY join_date DESC", fetch_all=True)
     if not rows:
         send_and_track(m.chat.id, "No users found.", back_button())
@@ -516,7 +493,7 @@ def users_cmd(m):
 def broadcast_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /broadcast <message>", back_button())
@@ -534,7 +511,7 @@ def broadcast_cmd(m):
 def maintenance_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
         active, msg = get_maintenance()
@@ -554,7 +531,7 @@ def maintenance_cmd(m):
 def stats_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     total_users = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
     total_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
     total_triggers = db_query("SELECT SUM(alerts_triggered) FROM profiles", fetch_one=True)[0] or 0
@@ -567,14 +544,14 @@ def stats_cmd(m):
 def start(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
     text, kb = main_menu()
     send_and_track(m.chat.id, text, kb)
 
 @bot.message_handler(commands=["cancel"])
 def cancel_cmd(m):
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     cid = m.chat.id
     uid = m.from_user.id
     with wait_lock:
@@ -588,7 +565,7 @@ def cancel_cmd(m):
 def price_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /price <symbol>", back_button())
@@ -608,7 +585,7 @@ def price_command(m):
 def info_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /info <symbol>", back_button())
@@ -636,7 +613,7 @@ def info_command(m):
 def gainers_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     g, _ = get_top_movers(10)
     if not g:
         text = "❌ No gainers data available."
@@ -651,7 +628,7 @@ def gainers_command(m):
 def losers_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     _, l = get_top_movers(10)
     if not l:
         text = "❌ No losers data available."
@@ -666,7 +643,7 @@ def losers_command(m):
 def multi_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /multi <symbol>", back_button())
@@ -693,7 +670,7 @@ def multi_command(m):
 def alert_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) != 4:
         send_and_track(m.chat.id, "Usage: /alert BTC > 50000   or   /alert BTC < 40000", back_button())
@@ -718,7 +695,7 @@ def alert_command(m):
 def myalerts_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     rows = db_query("SELECT id, coin, target, direction FROM alerts WHERE user_id=? AND chat_id=? AND active=1", (m.from_user.id, m.chat.id), fetch_all=True)
     if not rows:
         send_and_track(m.chat.id, "🔕 You have no active alerts.", back_button())
@@ -733,7 +710,7 @@ def myalerts_command(m):
 def cancelalert_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) != 2:
         send_and_track(m.chat.id, "Usage: /cancelalert <alert_id>", back_button())
@@ -754,7 +731,7 @@ def cancelalert_command(m):
 def scan_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /scan <contract_address>", back_button())
@@ -807,7 +784,7 @@ def scan_command(m):
 def profile_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     p = get_profile(m.from_user.id)
     text = (
         f"👤 <b>Your Profile</b>\n\n"
@@ -823,7 +800,7 @@ def profile_command(m):
 def ping_cmd(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    add_user_message(m.chat.id, m.message_id)
+    track_message(m.chat.id, m.message_id)
     send_and_track(m.chat.id, "🏓 Pong! Bot is alive.", back_button())
 
 # =========================
@@ -891,14 +868,6 @@ def multi_menu():
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
-def gainers_menu():
-    text = "📈 <b>Top 10 Gainers (24h)</b>\n\nFetching latest data..."
-    return text, back_button()
-
-def losers_menu():
-    text = "📉 <b>Top 10 Losers (24h)</b>\n\nFetching latest data..."
-    return text, back_button()
-
 def alerts_menu():
     text = "🔔 <b>Alert Traps</b>\n\nSet a price alert."
     kb = InlineKeyboardMarkup()
@@ -918,7 +887,7 @@ def scan_menu():
     return text, back_button()
 
 # =========================
-# CALLBACK HANDLERS (new message, delete button)
+# CALLBACK HANDLERS
 # =========================
 waiting = {}
 wait_lock = threading.RLock()
@@ -928,7 +897,7 @@ def back_main_cb(call):
     cid = call.message.chat.id
     with wait_lock:
         waiting.pop((cid, call.from_user.id), None)
-    # Delete the button message (it's a bot message, but it will be replaced by new menu)
+    # Delete the button message (it will be replaced)
     clear_old_button_message(cid, call.message.message_id)
     text, kb = main_menu()
     send_and_track(cid, text, kb)
@@ -1148,7 +1117,7 @@ def search_cb(call):
     bot.answer_callback_query(call.id)
 
 # =========================
-# TEXT HANDLER (custom alert and search)
+# TEXT HANDLER
 # =========================
 @bot.message_handler(func=lambda m: True)
 def text_handler(m):
@@ -1159,12 +1128,10 @@ def text_handler(m):
     with wait_lock:
         state = waiting.pop((cid, uid), None)
     if not state:
-        # Not in wait state – but we still want to track user messages? Only track commands, not random text.
-        # For simplicity, we ignore non‑command text if not waiting.
         return
 
-    # Track this user message (it's a response to a prompt, not a command, but still counts as user message)
-    add_user_message(cid, m.message_id)
+    # Track this user message (it's a response, not a command)
+    track_message(cid, m.message_id)
 
     if state == "custom_alert":
         pattern = r"^(\w+)\s*([<>])\s*([\d.]+)$"
@@ -1254,7 +1221,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – keeps last 5 bot messages & last 3 user commands")
+log.info("🚀 Persona Bot started – keeps last 5 messages (combined user+bot)")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
