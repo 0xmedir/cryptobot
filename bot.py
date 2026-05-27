@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Last 5 Messages (including inline button messages)
-- Keeps only the most recent 5 messages (user + bot + inline keyboards).
-- No instant deletion – oldest is removed when a 6th message arrives.
-- All commands, menus, and replies work normally.
+Persona Bot – Last 5 Messages (including inline buttons) + Fixed Contract Scanner
+- Keeps only the most recent 5 messages per chat.
+- No live updates, no WebSocket.
+- CA scanner now robust with retries and better error messages.
 """
 
 import telebot
@@ -34,7 +34,7 @@ if not BOT_TOKEN:
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "7458428092").split(",") if x.strip()]
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
-MAX_CHAT_MESSAGES = 5  # Keep only the last 5 messages per chat
+MAX_CHAT_MESSAGES = 5
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("PersonaBot")
@@ -43,7 +43,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
 # =========================
-# DATABASE
+# DATABASE (same as before)
 # =========================
 db_path = "data/persona.db"
 db_lock = threading.RLock()
@@ -139,7 +139,7 @@ def init_db():
 init_db()
 
 # =========================
-# REQUEST SESSION
+# REQUEST SESSION with retries
 # =========================
 session = requests.Session()
 retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
@@ -314,6 +314,9 @@ def get_multi_prices(symbol):
         log.error(f"Multi price error {symbol}: {e}")
     return None
 
+# =========================
+# CONTRACT SCANNER (FIXED)
+# =========================
 def scan_contract(address):
     if not address:
         return None, "Empty address"
@@ -321,33 +324,43 @@ def scan_contract(address):
     if len(addr) > MAX_CA_LENGTH:
         return None, "Address too long"
     addr_lower = addr.lower()
+    
+    # Try GoPlusLabs API (supports EVM and Solana)
     try:
         if re.match(r"^0x[a-f0-9]{40}$", addr_lower):
-            for chain in [1, 56]:
+            # EVM (Ethereum, BSC, etc.)
+            for chain in [1, 56]:  # 1 = Ethereum, 56 = BSC
                 url = f"https://api.gopluslabs.io/api/v1/token_security/{chain}?contract_addresses={addr_lower}"
-                r = session.get(url, timeout=15)
-                if r.status_code != 200:
+                try:
+                    r = session.get(url, timeout=15)
+                    if r.status_code == 200:
+                        data = r.json()
+                        result = data.get("result", {}).get(addr_lower, {})
+                        if result:
+                            return result, None
+                except Exception as e:
+                    log.warning(f"GoPlusLabs chain {chain} error: {e}")
                     continue
-                data = r.json()
-                result = data.get("result", {}).get(addr_lower, {})
-                if result:
-                    return result, None
-            return None, "Contract not found"
-        sol_addr = re.sub(r"[^a-zA-Z0-9]", "", addr)
-        if len(sol_addr) < 32 or len(sol_addr) > 44:
-            return None, "Invalid Solana address"
-        url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={sol_addr}"
-        r = session.get(url, timeout=15)
-        if r.status_code != 200:
-            return None, "API error"
-        data = r.json()
-        result = data.get("result", {}).get(sol_addr, {})
-        if not result:
-            return None, "Token not found"
-        return result, None
+            return None, "Contract not found or API error (GoPlusLabs)."
+        else:
+            # Solana address
+            sol_addr = re.sub(r"[^a-zA-Z0-9]", "", addr)
+            if len(sol_addr) < 32 or len(sol_addr) > 44:
+                return None, "Invalid Solana address."
+            url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={sol_addr}"
+            try:
+                r = session.get(url, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    result = data.get("result", {}).get(sol_addr, {})
+                    if result:
+                        return result, None
+            except Exception as e:
+                log.warning(f"Solana scanner error: {e}")
+            return None, "Solana contract not found or API error."
     except Exception as e:
         log.error(f"Scanner error: {e}")
-        return None, "Scanner failed"
+        return None, f"Scanner failed: {str(e)[:100]}"
 
 # =========================
 # ALERTS
@@ -427,11 +440,10 @@ def maintenance_block(uid, cid):
 # =========================
 # MESSAGE QUEUE – KEEP LAST 5 MESSAGES (including inline buttons)
 # =========================
-message_queues = {}  # chat_id -> list of message_ids (FIFO)
+message_queues = {}
 queue_lock = threading.RLock()
 
 def track_message(chat_id, message_id):
-    """Add message_id to the queue. If queue exceeds MAX_CHAT_MESSAGES, delete the oldest."""
     with queue_lock:
         if chat_id not in message_queues:
             message_queues[chat_id] = []
@@ -445,7 +457,6 @@ def track_message(chat_id, message_id):
                 log.warning(f"Failed to delete message {oldest} in chat {chat_id}: {e}")
 
 def send_and_track(chat_id, text, markup=None):
-    """Send a new message, then track it."""
     sent = safe_send(chat_id, text, markup)
     if sent:
         track_message(chat_id, sent.message_id)
@@ -463,7 +474,7 @@ def back_button():
 def users_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    track_message(m.chat.id, m.message_id)  # track user command
+    track_message(m.chat.id, m.message_id)
     rows = db_query("SELECT username, first_name, join_date FROM profiles ORDER BY join_date DESC", fetch_all=True)
     if not rows:
         send_and_track(m.chat.id, "No users found.", back_button())
@@ -877,7 +888,7 @@ def scan_menu():
     return text, back_button()
 
 # =========================
-# CALLBACK HANDLERS (no immediate deletion, just send new message)
+# CALLBACK HANDLERS
 # =========================
 waiting = {}
 wait_lock = threading.RLock()
@@ -887,7 +898,6 @@ def back_main_cb(call):
     cid = call.message.chat.id
     with wait_lock:
         waiting.pop((cid, call.from_user.id), None)
-    # Do NOT delete the old button message. It will be removed by the queue when needed.
     text, kb = main_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -1082,7 +1092,7 @@ def list_alerts_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
 def search_cb(call):
     cid = call.message.chat.id
-    mode = call.data.split("_")[1]  # price, info, multi
+    mode = call.data.split("_")[1]
     uid = call.from_user.id
     with wait_lock:
         waiting[(cid, uid)] = f"search_{mode}"
@@ -1103,10 +1113,7 @@ def text_handler(m):
         state = waiting.pop((cid, uid), None)
     if not state:
         return
-
-    # Track this user message (it's a response, not a command)
     track_message(cid, m.message_id)
-
     if state == "custom_alert":
         pattern = r"^(\w+)\s*([<>])\s*([\d.]+)$"
         match = re.match(pattern, m.text.strip().upper())
@@ -1124,11 +1131,9 @@ def text_handler(m):
             send_and_track(cid, err, back_button())
         else:
             send_and_track(cid, f"✅ Alert set for {coin} {direction} {target:,.2f}", back_button())
-        # Go back to alerts menu
         text, kb = alerts_menu()
         send_and_track(cid, text, kb)
         return
-
     if state.startswith("search_"):
         mode = state.split("_")[1]
         symbol = m.text.strip().upper()
@@ -1195,7 +1200,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – keeps last 5 messages (including inline buttons)")
+log.info("🚀 Persona Bot started – fixed contract scanner, last 5 messages")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
