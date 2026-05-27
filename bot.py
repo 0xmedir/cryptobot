@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Static Version (no editing, auto‑delete last 5 messages)
-- Every bot response is a new message (no editing)
-- Deletes last 5 bot messages per chat
-- Deletes user commands immediately
-- /users shows only name, username, join date (no user ID)
-- No live updates, no WebSocket
+Persona Bot – Chat History Version
+- Keeps last 5 bot messages and last 3 user commands
+- Auto‑deletes older messages to maintain clean Q&A flow
+- No live updates, no editing
+- /users shows only names, usernames, join dates
 """
 
 import telebot
@@ -36,7 +35,10 @@ if not BOT_TOKEN:
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "7458428092").split(",") if x.strip()]
 MAX_ALERTS_PER_USER = 20
 MAX_CA_LENGTH = 100
-MAX_HISTORY = 5  # keep last 5 bot messages
+
+# History limits
+MAX_BOT_MESSAGES = 5   # keep last 5 bot messages
+MAX_USER_COMMANDS = 3  # keep last 3 user commands
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("PersonaBot")
@@ -148,7 +150,7 @@ retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503,
 adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
-session.headers.update({"User-Agent": "PersonaBot/Static/2.0"})
+session.headers.update({"User-Agent": "PersonaBot/Static/3.0"})
 
 # =========================
 # HELPERS
@@ -181,12 +183,6 @@ def fmt_currency_value(currency_code, value):
     if value >= 1:
         return f"{symbol}{value:,.2f}"
     return f"{symbol}{value:.8f}"
-
-def delete_user_message(m):
-    try:
-        bot.delete_message(m.chat.id, m.message_id)
-    except Exception:
-        pass
 
 def safe_send(chat_id, text, markup=None):
     try:
@@ -358,7 +354,7 @@ def scan_contract(address):
         return None, "Scanner failed"
 
 # =========================
-# ALERTS (no background loop)
+# ALERTS
 # =========================
 def add_alert(user_id, chat_id, coin, target, direction):
     current = get_alert_count(user_id)
@@ -433,34 +429,59 @@ def maintenance_block(uid, cid):
     return True
 
 # =========================
-# MESSAGE QUEUE (new messages, delete old ones)
+# MESSAGE HISTORY MANAGER (Q&A flow)
 # =========================
-msg_queue = {}
-q_lock = threading.RLock()
+# Store per chat: list of user message IDs (commands) and bot message IDs
+user_msg_queues = {}
+bot_msg_queues = {}
+history_lock = threading.RLock()
 
-def send_and_track(chat_id, text, markup=None):
-    """Send a new message, then delete the oldest tracked message if > MAX_HISTORY."""
-    sent = safe_send(chat_id, text, markup)
-    if sent is None:
-        return None
-    with q_lock:
-        if chat_id not in msg_queue:
-            msg_queue[chat_id] = []
-        msg_queue[chat_id].append(sent.message_id)
-        while len(msg_queue[chat_id]) > MAX_HISTORY:
-            old = msg_queue[chat_id].pop(0)
+def add_user_message(chat_id, msg_id):
+    """Add a user command message ID, keep last MAX_USER_COMMANDS, delete oldest if exceeded."""
+    with history_lock:
+        if chat_id not in user_msg_queues:
+            user_msg_queues[chat_id] = []
+        queue = user_msg_queues[chat_id]
+        queue.append(msg_id)
+        while len(queue) > MAX_USER_COMMANDS:
+            old = queue.pop(0)
             try:
                 bot.delete_message(chat_id, old)
             except Exception as e:
-                log.warning(f"Failed to delete message {old}: {e}")
-    return sent
+                log.warning(f"Failed to delete user message {old}: {e}")
 
-def clear_old_message(chat_id, message_id):
-    """Delete a specific message (used for button messages that are no longer needed)."""
+def add_bot_message(chat_id, msg_id):
+    """Add a bot message ID, keep last MAX_BOT_MESSAGES, delete oldest if exceeded."""
+    with history_lock:
+        if chat_id not in bot_msg_queues:
+            bot_msg_queues[chat_id] = []
+        queue = bot_msg_queues[chat_id]
+        queue.append(msg_id)
+        while len(queue) > MAX_BOT_MESSAGES:
+            old = queue.pop(0)
+            try:
+                bot.delete_message(chat_id, old)
+            except Exception as e:
+                log.warning(f"Failed to delete bot message {old}: {e}")
+
+def clear_old_button_message(chat_id, msg_id):
+    """Delete a single message (used for inline keyboard messages that are replaced)."""
     try:
-        bot.delete_message(chat_id, message_id)
+        bot.delete_message(chat_id, msg_id)
     except Exception:
         pass
+
+def send_and_track(chat_id, text, markup=None, is_bot=True):
+    """Send a new message and track it in the appropriate queue."""
+    sent = safe_send(chat_id, text, markup)
+    if sent is None:
+        return None
+    if is_bot:
+        add_bot_message(chat_id, sent.message_id)
+    else:
+        # This would be for user messages, but we call add_user_message separately.
+        pass
+    return sent
 
 def back_button():
     kb = InlineKeyboardMarkup()
@@ -474,7 +495,8 @@ def back_button():
 def users_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    delete_user_message(m)
+    # Track user command
+    add_user_message(m.chat.id, m.message_id)
     rows = db_query("SELECT username, first_name, join_date FROM profiles ORDER BY join_date DESC", fetch_all=True)
     if not rows:
         send_and_track(m.chat.id, "No users found.", back_button())
@@ -494,7 +516,7 @@ def users_cmd(m):
 def broadcast_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /broadcast <message>", back_button())
@@ -512,7 +534,7 @@ def broadcast_cmd(m):
 def maintenance_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
         active, msg = get_maintenance()
@@ -532,7 +554,7 @@ def maintenance_cmd(m):
 def stats_cmd(m):
     if not is_admin(m.from_user.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     total_users = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
     total_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
     total_triggers = db_query("SELECT SUM(alerts_triggered) FROM profiles", fetch_one=True)[0] or 0
@@ -545,14 +567,14 @@ def stats_cmd(m):
 def start(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
     text, kb = main_menu()
     send_and_track(m.chat.id, text, kb)
 
 @bot.message_handler(commands=["cancel"])
 def cancel_cmd(m):
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     cid = m.chat.id
     uid = m.from_user.id
     with wait_lock:
@@ -566,7 +588,7 @@ def cancel_cmd(m):
 def price_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /price <symbol>", back_button())
@@ -586,7 +608,7 @@ def price_command(m):
 def info_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /info <symbol>", back_button())
@@ -614,7 +636,7 @@ def info_command(m):
 def gainers_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     g, _ = get_top_movers(10)
     if not g:
         text = "❌ No gainers data available."
@@ -629,7 +651,7 @@ def gainers_command(m):
 def losers_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     _, l = get_top_movers(10)
     if not l:
         text = "❌ No losers data available."
@@ -644,7 +666,7 @@ def losers_command(m):
 def multi_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /multi <symbol>", back_button())
@@ -671,7 +693,7 @@ def multi_command(m):
 def alert_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) != 4:
         send_and_track(m.chat.id, "Usage: /alert BTC > 50000   or   /alert BTC < 40000", back_button())
@@ -696,7 +718,7 @@ def alert_command(m):
 def myalerts_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     rows = db_query("SELECT id, coin, target, direction FROM alerts WHERE user_id=? AND chat_id=? AND active=1", (m.from_user.id, m.chat.id), fetch_all=True)
     if not rows:
         send_and_track(m.chat.id, "🔕 You have no active alerts.", back_button())
@@ -711,7 +733,7 @@ def myalerts_command(m):
 def cancelalert_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) != 2:
         send_and_track(m.chat.id, "Usage: /cancelalert <alert_id>", back_button())
@@ -732,7 +754,7 @@ def cancelalert_command(m):
 def scan_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
         send_and_track(m.chat.id, "Usage: /scan <contract_address>", back_button())
@@ -785,7 +807,7 @@ def scan_command(m):
 def profile_command(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     p = get_profile(m.from_user.id)
     text = (
         f"👤 <b>Your Profile</b>\n\n"
@@ -801,7 +823,7 @@ def profile_command(m):
 def ping_cmd(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
-    delete_user_message(m)
+    add_user_message(m.chat.id, m.message_id)
     send_and_track(m.chat.id, "🏓 Pong! Bot is alive.", back_button())
 
 # =========================
@@ -895,20 +917,8 @@ def scan_menu():
     text = "🛡 <b>Contract Scanner</b>\n\nSend a contract address (EVM or Solana).\n\nUse /scan <address>"
     return text, back_button()
 
-def coin_grid(prefix, coins):
-    kb = InlineKeyboardMarkup()
-    row = []
-    for i, coin in enumerate(coins, 1):
-        row.append(InlineKeyboardButton(coin, callback_data=f"{prefix}_{coin}"))
-        if i % 3 == 0:
-            kb.row(*row)
-            row = []
-    if row:
-        kb.row(*row)
-    return kb
-
 # =========================
-# CALLBACK HANDLERS (new message instead of edit)
+# CALLBACK HANDLERS (new message, delete button)
 # =========================
 waiting = {}
 wait_lock = threading.RLock()
@@ -918,8 +928,8 @@ def back_main_cb(call):
     cid = call.message.chat.id
     with wait_lock:
         waiting.pop((cid, call.from_user.id), None)
-    # Delete the button message
-    clear_old_message(cid, call.message.message_id)
+    # Delete the button message (it's a bot message, but it will be replaced by new menu)
+    clear_old_button_message(cid, call.message.message_id)
     text, kb = main_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -927,7 +937,7 @@ def back_main_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_price")
 def menu_price_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     text, kb = price_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -935,7 +945,7 @@ def menu_price_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_info")
 def menu_info_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     text, kb = info_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -943,7 +953,7 @@ def menu_info_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_multi")
 def menu_multi_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     text, kb = multi_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -951,7 +961,7 @@ def menu_multi_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_gainers")
 def menu_gainers_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     g, _ = get_top_movers(10)
     if not g:
         text = "❌ No gainers data available."
@@ -966,7 +976,7 @@ def menu_gainers_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_losers")
 def menu_losers_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     _, l = get_top_movers(10)
     if not l:
         text = "❌ No losers data available."
@@ -981,7 +991,7 @@ def menu_losers_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_alerts")
 def menu_alerts_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     text, kb = alerts_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -989,7 +999,7 @@ def menu_alerts_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_scan")
 def menu_scan_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     text, kb = scan_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -997,7 +1007,7 @@ def menu_scan_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "profile")
 def profile_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     uid = call.from_user.id
     p = get_profile(uid)
     text = (
@@ -1014,7 +1024,7 @@ def profile_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def price_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     price, change = get_price(symbol)
     if price is None:
@@ -1030,7 +1040,7 @@ def price_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
 def info_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     info = get_coin_info(symbol)
     if not info:
@@ -1054,7 +1064,7 @@ def info_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("multi_"))
 def multi_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     prices = get_multi_prices(symbol)
     if not prices:
@@ -1077,7 +1087,7 @@ def multi_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("setalert_"))
 def set_alert_preset_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     parts = call.data.split("_")
     if len(parts) < 4:
         bot.answer_callback_query(call.id, "Invalid alert format")
@@ -1101,7 +1111,7 @@ def set_alert_preset_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "custom_alert")
 def custom_alert_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     uid = call.from_user.id
     with wait_lock:
         waiting[(cid, uid)] = "custom_alert"
@@ -1112,7 +1122,7 @@ def custom_alert_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "list_alerts")
 def list_alerts_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     uid = call.from_user.id
     rows = db_query("SELECT id, coin, target, direction FROM alerts WHERE user_id=? AND chat_id=? AND active=1", (uid, cid), fetch_all=True)
     if not rows:
@@ -1128,7 +1138,7 @@ def list_alerts_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
 def search_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
+    clear_old_button_message(cid, call.message.message_id)
     mode = call.data.split("_")[1]  # price, info, multi
     uid = call.from_user.id
     with wait_lock:
@@ -1149,9 +1159,12 @@ def text_handler(m):
     with wait_lock:
         state = waiting.pop((cid, uid), None)
     if not state:
+        # Not in wait state – but we still want to track user messages? Only track commands, not random text.
+        # For simplicity, we ignore non‑command text if not waiting.
         return
 
-    delete_user_message(m)
+    # Track this user message (it's a response to a prompt, not a command, but still counts as user message)
+    add_user_message(cid, m.message_id)
 
     if state == "custom_alert":
         pattern = r"^(\w+)\s*([<>])\s*([\d.]+)$"
@@ -1241,7 +1254,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – static, no editing, auto‑delete last 5 messages")
+log.info("🚀 Persona Bot started – keeps last 5 bot messages & last 3 user commands")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
