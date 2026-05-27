@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final Working Version
-- Keeps last 5 messages (user + bot + buttons)
-- All commands work (price, info, gainers, losers, multi, alerts, scan, profile, admin)
-- No live updates, no WebSocket, no Etherscan
-- Fixed database schema with migration
+Persona Bot – Full Inline Menu + Working Contract Scanner
+- Inline keyboard menus (price, info, gainers, losers, multi, alerts, scan, profile)
+- Static data (no live updates, no WebSocket)
+- Keeps last 5 messages per chat (auto-delete oldest)
+- Contract scanner works with GoPlusLabs (timeout, error handling)
 """
 
 import telebot
@@ -44,7 +44,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
 # =========================
-# DATABASE (with proper migration)
+# DATABASE (fixed schema)
 # =========================
 db_path = "data/persona.db"
 db_lock = threading.RLock()
@@ -94,10 +94,9 @@ def init_db():
         columns = [col[1] for col in cur.fetchall()]
         if "username" not in columns:
             conn.execute("ALTER TABLE profiles ADD COLUMN username TEXT")
-            conn.commit()
         if "first_name" not in columns:
             conn.execute("ALTER TABLE profiles ADD COLUMN first_name TEXT")
-            conn.commit()
+        conn.commit()
     except Exception as e:
         log.warning(f"Migration alter error: {e}")
 
@@ -181,7 +180,7 @@ def get_profile(user_id):
     if not row:
         now = int(time.time())
         db_query("INSERT INTO profiles(user_id, join_date) VALUES(?,?)", (user_id, now))
-        row = (user_id, now, 0, 0, 0, None, None)  # 7 columns
+        row = (user_id, now, 0, 0, 0, None, None)
     return {
         "user_id": row[0],
         "join_date": row[1],
@@ -229,10 +228,11 @@ def send_and_track(chat_id, text, markup=None):
         track_message(chat_id, sent.message_id)
     return sent
 
-def back_button():
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-    return kb
+def clear_message(chat_id, msg_id):
+    try:
+        bot.delete_message(chat_id, msg_id)
+    except:
+        pass
 
 # =========================
 # API FUNCTIONS
@@ -243,8 +243,8 @@ def get_price(symbol):
         if r.status_code == 200:
             data = r.json()
             return float(data["lastPrice"]), float(data["priceChangePercent"])
-    except Exception as e:
-        log.error(f"Price error: {e}")
+    except:
+        pass
     return None, None
 
 def get_top_movers(limit=10):
@@ -307,9 +307,10 @@ def scan_contract(address):
     if len(addr) > MAX_CA_LENGTH:
         return None, "Address too long"
     addr_lower = addr.lower()
+    # Try GoPlusLabs (EVM chains)
     try:
         if re.match(r"^0x[a-f0-9]{40}$", addr_lower):
-            for chain in [1, 56]:
+            for chain in [1, 56]:  # Ethereum, BSC
                 url = f"https://api.gopluslabs.io/api/v1/token_security/{chain}?contract_addresses={addr_lower}"
                 try:
                     r = session.get(url, timeout=10)
@@ -321,8 +322,9 @@ def scan_contract(address):
                 except Exception as e:
                     log.warning(f"GoPlus chain {chain} error: {e}")
                     continue
-            return None, "Contract not found on Ethereum or BSC."
+            return None, "Contract not found on Ethereum or BSC (GoPlusLabs)."
         else:
+            # Solana
             sol_addr = re.sub(r"[^a-zA-Z0-9]", "", addr)
             if len(sol_addr) < 32 or len(sol_addr) > 44:
                 return None, "Invalid Solana address."
@@ -333,10 +335,10 @@ def scan_contract(address):
                 result = data.get("result", {}).get(sol_addr, {})
                 if result:
                     return result, None
-            return None, "Solana contract not found."
+            return None, "Solana contract not found (GoPlusLabs)."
     except Exception as e:
-        log.error(f"Scanner fatal error: {e}")
-        return None, "Scanner error: API timeout or unreachable."
+        log.error(f"Scanner error: {e}")
+        return None, f"Scanner error: {str(e)[:100]}"
 
 # =========================
 # ALERTS
@@ -392,17 +394,404 @@ def maintenance_block(uid, cid):
     return True
 
 # =========================
-# COMMAND HANDLERS
+# INLINE MENU DEFINITIONS
+# =========================
+def main_menu():
+    text = "⚡ <b>PERSONA</b>\n\nFast crypto tools: prices, alerts, intel."
+    kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("💰 Price check", callback_data="menu_price"),
+           InlineKeyboardButton("🔔 Alert traps", callback_data="menu_alerts"))
+    kb.row(InlineKeyboardButton("📈 Gainers (top 10)", callback_data="menu_gainers"),
+           InlineKeyboardButton("📉 Losers (top 10)", callback_data="menu_losers"))
+    kb.row(InlineKeyboardButton("🔎 Coin info", callback_data="menu_info"),
+           InlineKeyboardButton("💱 Currencies", callback_data="menu_multi"))
+    kb.row(InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"),
+           InlineKeyboardButton("📋 My alerts", callback_data="list_alerts"))
+    kb.row(InlineKeyboardButton("👤 Profile", callback_data="profile"))
+    return text, kb
+
+def price_menu():
+    text = "💵 <b>Price Check</b>\n\nTap a coin to see current price."
+    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
+    kb = InlineKeyboardMarkup()
+    row = []
+    for coin in coins:
+        row.append(InlineKeyboardButton(coin, callback_data=f"price_{coin}"))
+        if len(row) == 3:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
+    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_price"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return text, kb
+
+def info_menu():
+    text = "🔎 <b>Coin Info</b>\n\nPick a coin for market data."
+    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
+    kb = InlineKeyboardMarkup()
+    row = []
+    for coin in coins:
+        row.append(InlineKeyboardButton(coin, callback_data=f"info_{coin}"))
+        if len(row) == 3:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
+    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_info"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return text, kb
+
+def multi_menu():
+    text = "💱 <b>Currencies</b>\n\nSelect a coin for multi‑currency rates."
+    coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "LINK"]
+    kb = InlineKeyboardMarkup()
+    row = []
+    for coin in coins:
+        row.append(InlineKeyboardButton(coin, callback_data=f"multi_{coin}"))
+        if len(row) == 3:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
+    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return text, kb
+
+def alerts_menu():
+    text = "🔔 <b>Alert Traps</b>\n\nSet a price alert."
+    kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("BTC > 100k", callback_data="setalert_BTC_>_100000"),
+           InlineKeyboardButton("BTC < 80k", callback_data="setalert_BTC_<_80000"))
+    kb.row(InlineKeyboardButton("ETH > 4k", callback_data="setalert_ETH_>_4000"),
+           InlineKeyboardButton("ETH < 2k", callback_data="setalert_ETH_<_2000"))
+    kb.row(InlineKeyboardButton("SOL > 200", callback_data="setalert_SOL_>_200"),
+           InlineKeyboardButton("SOL < 100", callback_data="setalert_SOL_<_100"))
+    kb.row(InlineKeyboardButton("✏️ Custom alert", callback_data="custom_alert"))
+    kb.row(InlineKeyboardButton("📋 My alerts", callback_data="list_alerts"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return text, kb
+
+def scan_menu():
+    text = "🛡 <b>Contract Scanner</b>\n\nSend a contract address (EVM or Solana).\n\nUse /scan <address>"
+    return text, InlineKeyboardMarkup().row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+
+def back_button():
+    kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return kb
+
+# =========================
+# CALLBACK HANDLERS (for inline menus)
+# =========================
+waiting = {}
+wait_lock = threading.RLock()
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_main")
+def back_main_cb(call):
+    cid = call.message.chat.id
+    with wait_lock:
+        waiting.pop((cid, call.from_user.id), None)
+    # Delete the old button message (it will be removed from queue eventually, but we can delete it now to avoid clutter)
+    clear_message(cid, call.message.message_id)
+    text, kb = main_menu()
+    send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_price")
+def menu_price_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    text, kb = price_menu()
+    send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_info")
+def menu_info_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    text, kb = info_menu()
+    send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_multi")
+def menu_multi_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    text, kb = multi_menu()
+    send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_gainers")
+def menu_gainers_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    g, _ = get_top_movers(10)
+    if not g:
+        text = "❌ No gainers data available."
+    else:
+        text = "📈 <b>Top 10 Gainers (24h)</b>\n\n"
+        for d in g:
+            coin = d["symbol"].removesuffix("USDT")
+            text += f"🟢 <b>{h(coin)}</b>  ▲ {float(d['priceChangePercent']):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_losers")
+def menu_losers_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    _, l = get_top_movers(10)
+    if not l:
+        text = "❌ No losers data available."
+    else:
+        text = "📉 <b>Top 10 Losers (24h)</b>\n\n"
+        for d in l:
+            coin = d["symbol"].removesuffix("USDT")
+            text += f"🔴 <b>{h(coin)}</b>  ▼ {abs(float(d['priceChangePercent'])):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_alerts")
+def menu_alerts_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    text, kb = alerts_menu()
+    send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_scan")
+def menu_scan_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    text, kb = scan_menu()
+    send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "profile")
+def profile_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    uid = call.from_user.id
+    p = get_profile(uid)
+    text = (f"👤 <b>Your Profile</b>\n\n"
+            f"User ID: {p['user_id']}\n"
+            f"Joined: {time.strftime('%Y-%m-%d', time.localtime(p['join_date']))}\n"
+            f"Alerts set: {p['alerts_set']}\n"
+            f"Alerts triggered: {p['alerts_triggered']}\n"
+            f"Active alerts: {get_alert_count(uid)}")
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
+def price_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    symbol = call.data.split("_")[1]
+    price, change = get_price(symbol)
+    if price is None:
+        text = f"❌ Could not fetch price for {symbol}"
+    else:
+        text = f"💰 <b>{symbol}</b>\n{fmt_price(price)} ({change:+.2f}%)"
+        # Check alerts (optional, but keeps consistency)
+        triggered = check_alerts_for_symbol(call.from_user.id, cid, symbol, price)
+        for coin, direction, target in triggered:
+            text += f"\n\n🚨 Alert triggered: {coin} {direction} {target:,.2f}"
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
+def info_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    symbol = call.data.split("_")[1]
+    info = get_coin_info(symbol)
+    if not info:
+        text = f"❌ No info found for {symbol}"
+    else:
+        text = (f"🔎 <b>{info['name']} ({info['symbol']})</b>\n"
+                f"🏆 Rank: #{info['rank']}\n"
+                f"💰 Price: {fmt_price(info['price'])}\n"
+                f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+                f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+                f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
+                f"📊 24h Volume: {fmt_price(info['volume'])}\n"
+                f"💎 Circulating Supply: {info['supply']:,.0f}")
+        if info['max_supply']:
+            text += f"\n🔒 Max Supply: {info['max_supply']:,.0f}"
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("multi_"))
+def multi_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    symbol = call.data.split("_")[1]
+    prices = get_multi_prices(symbol)
+    if not prices:
+        text = f"❌ Failed to fetch multi‑currency data for {symbol}"
+    else:
+        order = [("usd","USD"),("eur","EUR"),("gbp","GBP"),("jpy","JPY"),("cny","CNY"),("aed","AED"),("try","TRY"),("inr","INR"),("krw","KRW"),("cad","CAD"),("aud","AUD")]
+        text = f"💱 <b>{symbol} – Currencies</b>\n\n"
+        for code, name in order:
+            val = prices.get(code)
+            if val is not None:
+                text += f"{name}: {fmt_currency_value(code, val)}\n"
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("setalert_"))
+def set_alert_preset_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    parts = call.data.split("_")
+    if len(parts) < 4:
+        bot.answer_callback_query(call.id, "Invalid alert format")
+        return
+    coin = parts[1]
+    direction = parts[2]
+    try:
+        target = float(parts[3])
+    except ValueError:
+        bot.answer_callback_query(call.id, "Invalid target")
+        return
+    uid = call.from_user.id
+    aid, err = add_alert(uid, cid, coin, target, direction)
+    if err:
+        text = err
+    else:
+        text = f"✅ Alert set for {coin} {direction} {target:,.2f}"
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "custom_alert")
+def custom_alert_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    uid = call.from_user.id
+    with wait_lock:
+        waiting[(cid, uid)] = "custom_alert"
+    text = "✏️ Send alert in format: <code>COIN > 12345</code> or <code>COIN < 12345</code>\nExample: <code>BTC > 70000</code>\n\nSend /cancel to abort."
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "list_alerts")
+def list_alerts_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    uid = call.from_user.id
+    rows = db_query("SELECT id, coin, target, direction FROM alerts WHERE user_id=? AND chat_id=? AND active=1", (uid, cid), fetch_all=True)
+    if not rows:
+        text = "🔕 You have no active alerts."
+    else:
+        text = "🔔 <b>Your active alerts</b>\n\n"
+        for aid, coin, target, direction in rows:
+            text += f"• {coin} {direction} {target:,.2f}  (ID: {aid})\n"
+        text += "\nUse /cancelalert <ID> to remove."
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
+def search_cb(call):
+    cid = call.message.chat.id
+    clear_message(cid, call.message.message_id)
+    mode = call.data.split("_")[1]  # price, info, multi
+    uid = call.from_user.id
+    with wait_lock:
+        waiting[(cid, uid)] = f"search_{mode}"
+    text = "🔍 Send the coin symbol (e.g., BTC, PEPE).\nSend /cancel to abort."
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+# =========================
+# TEXT HANDLER (custom alert and search)
+# =========================
+@bot.message_handler(func=lambda m: True)
+def text_handler(m):
+    if m.text and m.text.startswith("/"):
+        return
+    cid = m.chat.id
+    uid = m.from_user.id
+    with wait_lock:
+        state = waiting.pop((cid, uid), None)
+    if not state:
+        return
+    # Track this user message (it's part of the conversation)
+    track_message(cid, m.message_id)
+    if state == "custom_alert":
+        pattern = r"^(\w+)\s*([<>])\s*([\d.]+)$"
+        match = re.match(pattern, m.text.strip().upper())
+        if not match:
+            send_and_track(cid, "❌ Invalid format. Use: COIN > 12345", back_button())
+            return
+        coin, direction, target_str = match.groups()
+        try:
+            target = float(target_str)
+        except ValueError:
+            send_and_track(cid, "❌ Invalid number.", back_button())
+            return
+        aid, err = add_alert(uid, cid, coin, target, direction)
+        if err:
+            send_and_track(cid, err, back_button())
+        else:
+            send_and_track(cid, f"✅ Alert set for {coin} {direction} {target:,.2f}", back_button())
+        # Return to alerts menu
+        text, kb = alerts_menu()
+        send_and_track(cid, text, kb)
+        return
+    if state.startswith("search_"):
+        mode = state.split("_")[1]
+        symbol = m.text.strip().upper()
+        if mode == "price":
+            price, change = get_price(symbol)
+            if price is None:
+                text = f"❌ Could not fetch price for {symbol}"
+            else:
+                text = f"💰 <b>{symbol}</b>\n{fmt_price(price)} ({change:+.2f}%)"
+                triggered = check_alerts_for_symbol(uid, cid, symbol, price)
+                for coin, direction, target in triggered:
+                    text += f"\n\n🚨 Alert triggered: {coin} {direction} {target:,.2f}"
+        elif mode == "info":
+            info = get_coin_info(symbol)
+            if not info:
+                text = f"❌ No info found for {symbol}"
+            else:
+                text = (f"🔎 <b>{info['name']} ({info['symbol']})</b>\n"
+                        f"🏆 Rank: #{info['rank']}\n"
+                        f"💰 Price: {fmt_price(info['price'])}\n"
+                        f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+                        f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+                        f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
+                        f"📊 24h Volume: {fmt_price(info['volume'])}\n"
+                        f"💎 Circulating Supply: {info['supply']:,.0f}")
+                if info['max_supply']:
+                    text += f"\n🔒 Max Supply: {info['max_supply']:,.0f}"
+        elif mode == "multi":
+            prices = get_multi_prices(symbol)
+            if not prices:
+                text = f"❌ Failed to fetch multi‑currency data for {symbol}"
+            else:
+                order = [("usd","USD"),("eur","EUR"),("gbp","GBP"),("jpy","JPY"),("cny","CNY"),("aed","AED"),("try","TRY"),("inr","INR"),("krw","KRW"),("cad","CAD"),("aud","AUD")]
+                text = f"💱 <b>{symbol} – Currencies</b>\n\n"
+                for code, name in order:
+                    val = prices.get(code)
+                    if val is not None:
+                        text += f"{name}: {fmt_currency_value(code, val)}\n"
+        else:
+            return
+        send_and_track(cid, text, back_button())
+
+# =========================
+# COMMAND HANDLERS (fallback for direct commands)
 # =========================
 @bot.message_handler(commands=["start", "help"])
-def start(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def start_cmd(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     log_interaction(m.from_user.id, m.from_user.username, m.from_user.first_name, "/start")
-    text = ("⚡ <b>Persona Bot</b>\n\n"
-            "/price BTC\n/info BTC\n/gainers\n/losers\n/multi BTC\n"
-            "/alert BTC > 50000\n/my alerts\n/scan 0x...\n/profile\n/ping")
-    send_and_track(m.chat.id, text, back_button())
+    text, kb = main_menu()
+    send_and_track(m.chat.id, text, kb)
 
 @bot.message_handler(commands=["cancel"])
 def cancel_cmd(m):
@@ -415,12 +804,6 @@ def cancel_cmd(m):
         send_and_track(cid, "❌ Cancelled.", back_button())
     else:
         send_and_track(cid, "Nothing to cancel.", back_button())
-
-@bot.message_handler(commands=["ping"])
-def ping_cmd(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
-    track_message(m.chat.id, m.message_id)
-    send_and_track(m.chat.id, "🏓 Pong! Bot is alive.", back_button())
 
 @bot.message_handler(commands=["price"])
 def price_command(m):
@@ -449,18 +832,18 @@ def info_command(m):
     info = get_coin_info(sym)
     if not info:
         send_and_track(m.chat.id, f"❌ No info for {sym}", back_button())
-        return
-    text = (f"🔎 <b>{info['name']} ({info['symbol']})</b>\n"
-            f"🏆 Rank: #{info['rank']}\n"
-            f"💰 Price: {fmt_price(info['price'])}\n"
-            f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
-            f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
-            f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
-            f"📊 24h Volume: {fmt_price(info['volume'])}\n"
-            f"💎 Circulating Supply: {info['supply']:,.0f}")
-    if info['max_supply']:
-        text += f"\n🔒 Max Supply: {info['max_supply']:,.0f}"
-    send_and_track(m.chat.id, text, back_button())
+    else:
+        text = (f"🔎 <b>{info['name']} ({info['symbol']})</b>\n"
+                f"🏆 Rank: #{info['rank']}\n"
+                f"💰 Price: {fmt_price(info['price'])}\n"
+                f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+                f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+                f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
+                f"📊 24h Volume: {fmt_price(info['volume'])}\n"
+                f"💎 Circulating Supply: {info['supply']:,.0f}")
+        if info['max_supply']:
+            text += f"\n🔒 Max Supply: {info['max_supply']:,.0f}"
+        send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["gainers"])
 def gainers_command(m):
@@ -541,11 +924,11 @@ def myalerts_command(m):
     track_message(m.chat.id, m.message_id)
     rows = db_query("SELECT id, coin, target, direction FROM alerts WHERE user_id=? AND chat_id=? AND active=1", (m.from_user.id, m.chat.id), fetch_all=True)
     if not rows:
-        send_and_track(m.chat.id, "🔕 You have no active alerts.", back_button())
+        send_and_track(m.chat.id, "🔕 No active alerts.", back_button())
         return
     text = "🔔 <b>Your alerts</b>\n\n"
     for aid, coin, target, direction in rows:
-        text += f"• {coin} {direction} {target:,.2f}  (ID: {aid})\n"
+        text += f"• {coin} {direction} {target:,.2f} (ID: {aid})\n"
     text += "\nUse /cancelalert <ID> to remove."
     send_and_track(m.chat.id, text, back_button())
 
@@ -584,20 +967,20 @@ def scan_command(m):
         return
     text = "🛡 <b>Contract Security</b>\n\n"
     text += f"<code>{address[:20]}...{address[-10:]}</code>\n\n"
-    risk_flags = []
     risk_map = {"is_honeypot": "🍯 Honeypot", "is_mintable": "🖨 Mintable", "is_proxy": "🔀 Proxy", "is_blacklisted": "⛔ Blacklist"}
+    flags = []
     for f, label in risk_map.items():
         if str(result.get(f, "")) == "1":
-            risk_flags.append(f"⚠️ {label}: YES")
+            flags.append(f"⚠️ {label}: YES")
     buy_tax = result.get("buy_tax")
     if buy_tax:
         try:
             pct = float(buy_tax) * 100
             if pct > 0:
-                risk_flags.append(f"⚠️ Buy tax: {pct:.1f}%")
+                flags.append(f"⚠️ Buy tax: {pct:.1f}%")
         except: pass
-    if risk_flags:
-        text += "<b>Risk flags:</b>\n" + "\n".join(risk_flags) + "\n"
+    if flags:
+        text += "<b>Risk flags:</b>\n" + "\n".join(flags) + "\n"
     else:
         text += "✅ No high‑risk flags detected.\n"
     text += "\n🔗 <a href='https://gopluslabs.io/'>GoPlusLabs</a>"
@@ -615,6 +998,12 @@ def profile_command(m):
             f"Alerts triggered: {p['alerts_triggered']}\n"
             f"Active alerts: {get_alert_count(m.from_user.id)}")
     send_and_track(m.chat.id, text, back_button())
+
+@bot.message_handler(commands=["ping"])
+def ping_cmd(m):
+    if maintenance_block(m.from_user.id, m.chat.id): return
+    track_message(m.chat.id, m.message_id)
+    send_and_track(m.chat.id, "🏓 Pong! Bot is alive.", back_button())
 
 # =========================
 # ADMIN COMMANDS
@@ -683,20 +1072,6 @@ def stats_cmd(m):
     send_and_track(m.chat.id, f"📊 <b>Stats</b>\n\nUsers: {total_users}\nActive alerts: {total_alerts}\nTriggers: {total_triggers}", back_button())
 
 # =========================
-# SIMPLE INLINE MENU (optional)
-# =========================
-waiting = {}
-wait_lock = threading.RLock()
-
-@bot.callback_query_handler(func=lambda call: call.data == "back_main")
-def back_main_cb(call):
-    cid = call.message.chat.id
-    with wait_lock:
-        waiting.pop((cid, call.from_user.id), None)
-    send_and_track(cid, "Main menu", back_button())
-    bot.answer_callback_query(call.id)
-
-# =========================
 # SHUTDOWN
 # =========================
 def stop(sig, frame):
@@ -713,7 +1088,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – final version, database schema fixed")
+log.info("🚀 Persona Bot started – inline menus + working contract scanner, last 5 messages")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
