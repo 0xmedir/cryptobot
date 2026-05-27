@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Last 5 Messages Only (combined user + bot)
-- Keeps the most recent 5 messages in the chat.
-- Deletes the oldest message when a 6th arrives.
-- No instant deletion – your commands stay visible until they fall out of the 5-message window.
-- All features: price, info, gainers, losers, multi, alerts, scan, profile, admin commands.
+Persona Bot – Last 5 Messages (including inline button messages)
+- Keeps only the most recent 5 messages (user + bot + inline keyboards).
+- No instant deletion – oldest is removed when a 6th message arrives.
+- All commands, menus, and replies work normally.
 """
 
 import telebot
@@ -147,7 +146,7 @@ retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503,
 adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
-session.headers.update({"User-Agent": "PersonaBot/Static/4.0"})
+session.headers.update({"User-Agent": "PersonaBot/Static/5.0"})
 
 # =========================
 # HELPERS
@@ -426,7 +425,7 @@ def maintenance_block(uid, cid):
     return True
 
 # =========================
-# MESSAGE QUEUE – KEEP LAST 5 MESSAGES (combined)
+# MESSAGE QUEUE – KEEP LAST 5 MESSAGES (including inline buttons)
 # =========================
 message_queues = {}  # chat_id -> list of message_ids (FIFO)
 queue_lock = threading.RLock()
@@ -444,15 +443,6 @@ def track_message(chat_id, message_id):
                 bot.delete_message(chat_id, oldest)
             except Exception as e:
                 log.warning(f"Failed to delete message {oldest} in chat {chat_id}: {e}")
-
-def clear_old_button_message(chat_id, message_id):
-    """Delete a button message immediately (it will be replaced by a new menu)."""
-    try:
-        bot.delete_message(chat_id, message_id)
-    except Exception:
-        pass
-    # Also remove from queue if present? But it's already being deleted; we don't want to track it.
-    # We'll just leave it – it's gone.
 
 def send_and_track(chat_id, text, markup=None):
     """Send a new message, then track it."""
@@ -887,7 +877,7 @@ def scan_menu():
     return text, back_button()
 
 # =========================
-# CALLBACK HANDLERS
+# CALLBACK HANDLERS (no immediate deletion, just send new message)
 # =========================
 waiting = {}
 wait_lock = threading.RLock()
@@ -897,8 +887,7 @@ def back_main_cb(call):
     cid = call.message.chat.id
     with wait_lock:
         waiting.pop((cid, call.from_user.id), None)
-    # Delete the button message (it will be replaced)
-    clear_old_button_message(cid, call.message.message_id)
+    # Do NOT delete the old button message. It will be removed by the queue when needed.
     text, kb = main_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -906,7 +895,6 @@ def back_main_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_price")
 def menu_price_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     text, kb = price_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -914,7 +902,6 @@ def menu_price_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_info")
 def menu_info_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     text, kb = info_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -922,7 +909,6 @@ def menu_info_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_multi")
 def menu_multi_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     text, kb = multi_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -930,7 +916,6 @@ def menu_multi_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_gainers")
 def menu_gainers_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     g, _ = get_top_movers(10)
     if not g:
         text = "❌ No gainers data available."
@@ -945,7 +930,6 @@ def menu_gainers_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_losers")
 def menu_losers_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     _, l = get_top_movers(10)
     if not l:
         text = "❌ No losers data available."
@@ -960,7 +944,6 @@ def menu_losers_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_alerts")
 def menu_alerts_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     text, kb = alerts_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -968,7 +951,6 @@ def menu_alerts_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_scan")
 def menu_scan_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     text, kb = scan_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -976,7 +958,6 @@ def menu_scan_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "profile")
 def profile_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     uid = call.from_user.id
     p = get_profile(uid)
     text = (
@@ -993,7 +974,6 @@ def profile_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def price_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     price, change = get_price(symbol)
     if price is None:
@@ -1009,7 +989,6 @@ def price_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
 def info_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     info = get_coin_info(symbol)
     if not info:
@@ -1033,7 +1012,6 @@ def info_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("multi_"))
 def multi_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     prices = get_multi_prices(symbol)
     if not prices:
@@ -1056,7 +1034,6 @@ def multi_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("setalert_"))
 def set_alert_preset_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     parts = call.data.split("_")
     if len(parts) < 4:
         bot.answer_callback_query(call.id, "Invalid alert format")
@@ -1080,7 +1057,6 @@ def set_alert_preset_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "custom_alert")
 def custom_alert_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     uid = call.from_user.id
     with wait_lock:
         waiting[(cid, uid)] = "custom_alert"
@@ -1091,7 +1067,6 @@ def custom_alert_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "list_alerts")
 def list_alerts_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     uid = call.from_user.id
     rows = db_query("SELECT id, coin, target, direction FROM alerts WHERE user_id=? AND chat_id=? AND active=1", (uid, cid), fetch_all=True)
     if not rows:
@@ -1107,7 +1082,6 @@ def list_alerts_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
 def search_cb(call):
     cid = call.message.chat.id
-    clear_old_button_message(cid, call.message.message_id)
     mode = call.data.split("_")[1]  # price, info, multi
     uid = call.from_user.id
     with wait_lock:
@@ -1221,7 +1195,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – keeps last 5 messages (combined user+bot)")
+log.info("🚀 Persona Bot started – keeps last 5 messages (including inline buttons)")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
