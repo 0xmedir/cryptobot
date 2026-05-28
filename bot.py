@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Solid Final Version (409 conflict fixed)
-- Clears webhook and polling session thoroughly
-- Inline menus, working contract scanner
-- Keeps last 5 messages
-- No live updates, no crashes
+Persona Bot – Final (Token spaces fixed)
+- Inline menus, contract scanner, last 5 messages
+- Strips BOT_TOKEN to avoid spaces
 """
 
 import telebot
@@ -25,9 +23,9 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.apihelper import ApiTelegramException
 
 # =========================
-# CONFIG
+# CONFIG – TOKEN STRIPPED
 # =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN environment variable not set")
     sys.exit(1)
@@ -180,7 +178,6 @@ def get_profile(user_id):
         now = int(time.time())
         db_query("INSERT INTO profiles(user_id, join_date) VALUES(?,?)", (user_id, now))
         row = (user_id, now, 0, 0, 0, None, None)
-    # Ensure 7 elements (in case of old schema)
     if len(row) == 6:
         row = row + (0,)
     return {
@@ -694,7 +691,7 @@ def list_alerts_cb(call):
 def search_cb(call):
     cid = call.message.chat.id
     clear_old_message(cid, call.message.message_id)
-    mode = call.data.split("_")[1]  # price, info, multi
+    mode = call.data.split("_")[1]
     uid = call.from_user.id
     with wait_lock:
         waiting[(cid, uid)] = f"search_{mode}"
@@ -715,7 +712,7 @@ def text_handler(m):
         state = waiting.pop((cid, uid), None)
     if not state:
         return
-    track_message(cid, m.message_id)  # user's response message
+    track_message(cid, m.message_id)
     if state == "custom_alert":
         pattern = r"^(\w+)\s*([<>])\s*([\d.]+)$"
         match = re.match(pattern, m.text.strip().upper())
@@ -733,7 +730,6 @@ def text_handler(m):
             send_and_track(cid, err, back_button())
         else:
             send_and_track(cid, f"✅ Alert set for {coin} {direction} {target:,.2f}", back_button())
-        # Back to alerts menu
         text, kb = alerts_menu()
         send_and_track(cid, text, kb)
         return
@@ -780,7 +776,7 @@ def text_handler(m):
         send_and_track(cid, text, back_button())
 
 # =========================
-# SLASH COMMAND HANDLERS (as fallback)
+# SLASH COMMAND HANDLERS (fallback)
 # =========================
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(m):
@@ -1104,10 +1100,9 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
 # =========================
-# BOOT – with webhook cleanup to prevent 409 conflict
+# BOOT – with webhook cleanup
 # =========================
 if __name__ == "__main__":
-    # Remove any existing webhook and pending updates
     try:
         bot.remove_webhook()
         log.info("Webhook removed")
@@ -1115,7 +1110,6 @@ if __name__ == "__main__":
         log.warning(f"Could not remove webhook: {e}")
     time.sleep(1)
     try:
-        # Delete webhook again to be sure
         bot.delete_webhook()
         log.info("Webhook deleted")
     except Exception as e:
@@ -1123,5 +1117,4 @@ if __name__ == "__main__":
     time.sleep(2)
 
     log.info("🚀 Persona Bot started – solid version with inline menus and working CA scanner")
-    # Use infinity_polling with skip_pending=True and allowed_updates to avoid conflicts
     bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True, allowed_updates=['message', 'callback_query'])
