@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Full Inline Menu + Working Contract Scanner
-- Inline keyboard menus (price, info, gainers, losers, multi, alerts, scan, profile)
-- Static data (no live updates, no WebSocket)
-- Keeps last 5 messages per chat (auto-delete oldest)
-- Contract scanner works with GoPlusLabs (timeout, error handling)
+Persona Bot – Solid Final Version
+- Inline menus (reliable, no live updates)
+- Working contract scanner (GoPlusLabs with timeout)
+- Keeps last 5 messages per chat
+- No WebSocket, no background threads, no crashes
+- Admin commands included
 """
 
 import telebot
@@ -44,7 +45,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
 # =========================
-# DATABASE (fixed schema)
+# DATABASE (fixed schema with migration)
 # =========================
 db_path = "data/persona.db"
 db_lock = threading.RLock()
@@ -74,65 +75,64 @@ def db_query(query, params=(), fetch_one=False, fetch_all=False, retries=3):
             raise
     return None
 
-def init_db():
-    # Create profiles table with all columns
-    db_query("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            user_id INTEGER PRIMARY KEY,
-            join_date INTEGER,
-            total_interactions INTEGER DEFAULT 0,
-            alerts_set INTEGER DEFAULT 0,
-            alerts_triggered INTEGER DEFAULT 0,
-            username TEXT,
-            first_name TEXT
-        )
-    """)
-    # Add missing columns if table existed without them
-    try:
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(profiles)")
-        columns = [col[1] for col in cur.fetchall()]
-        if "username" not in columns:
-            conn.execute("ALTER TABLE profiles ADD COLUMN username TEXT")
-        if "first_name" not in columns:
-            conn.execute("ALTER TABLE profiles ADD COLUMN first_name TEXT")
-        conn.commit()
-    except Exception as e:
-        log.warning(f"Migration alter error: {e}")
+# Create tables with all needed columns
+db_query("""
+    CREATE TABLE IF NOT EXISTS profiles (
+        user_id INTEGER PRIMARY KEY,
+        join_date INTEGER,
+        total_interactions INTEGER DEFAULT 0,
+        alerts_set INTEGER DEFAULT 0,
+        alerts_triggered INTEGER DEFAULT 0,
+        username TEXT,
+        first_name TEXT
+    )
+""")
+# Add missing columns if any
+try:
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(profiles)")
+    cols = [c[1] for c in cur.fetchall()]
+    if "total_interactions" not in cols:
+        conn.execute("ALTER TABLE profiles ADD COLUMN total_interactions INTEGER DEFAULT 0")
+    if "username" not in cols:
+        conn.execute("ALTER TABLE profiles ADD COLUMN username TEXT")
+    if "first_name" not in cols:
+        conn.execute("ALTER TABLE profiles ADD COLUMN first_name TEXT")
+    conn.commit()
+except Exception as e:
+    log.warning(f"Migration: {e}")
 
-    db_query("""
-        CREATE TABLE IF NOT EXISTS alerts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            chat_id INTEGER,
-            coin TEXT,
-            target REAL,
-            direction TEXT,
-            active INTEGER DEFAULT 1,
-            created_at INTEGER
-        )
-    """)
-    db_query("""
-        CREATE TABLE IF NOT EXISTS analytics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp INTEGER,
-            user_id INTEGER,
-            username TEXT,
-            first_name TEXT,
-            command TEXT,
-            details TEXT
-        )
-    """)
-    db_query("""
-        CREATE TABLE IF NOT EXISTS maintenance (
-            id INTEGER PRIMARY KEY CHECK (id=1),
-            active INTEGER DEFAULT 0,
-            message TEXT DEFAULT ''
-        )
-    """)
-    db_query("INSERT OR IGNORE INTO maintenance(id, active, message) VALUES(1,0,'')")
-
-init_db()
+db_query("""
+    CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        chat_id INTEGER,
+        coin TEXT,
+        target REAL,
+        direction TEXT,
+        active INTEGER DEFAULT 1,
+        created_at INTEGER
+    )
+""")
+db_query("""
+    CREATE TABLE IF NOT EXISTS analytics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER,
+        user_id INTEGER,
+        username TEXT,
+        first_name TEXT,
+        command TEXT,
+        details TEXT
+    )
+""")
+db_query("""
+    CREATE TABLE IF NOT EXISTS maintenance (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        active INTEGER DEFAULT 0,
+        message TEXT DEFAULT ''
+    )
+""")
+db_query("INSERT OR IGNORE INTO maintenance(id, active, message) VALUES(1,0,'')")
 
 # =========================
 # REQUEST SESSION
@@ -142,7 +142,7 @@ retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503,
 adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
-session.headers.update({"User-Agent": "PersonaBot/1.0"})
+session.headers.update({"User-Agent": "PersonaBot/2.0"})
 
 # =========================
 # HELPERS
@@ -181,14 +181,17 @@ def get_profile(user_id):
         now = int(time.time())
         db_query("INSERT INTO profiles(user_id, join_date) VALUES(?,?)", (user_id, now))
         row = (user_id, now, 0, 0, 0, None, None)
+    # Ensure 7 elements (in case of old schema)
+    if len(row) == 6:
+        row = row + (0,)  # add missing total_interactions
     return {
         "user_id": row[0],
         "join_date": row[1],
-        "total_interactions": row[2],
-        "alerts_set": row[3],
-        "alerts_triggered": row[4],
-        "username": row[5],
-        "first_name": row[6]
+        "total_interactions": row[2] if len(row) > 2 else 0,
+        "alerts_set": row[3] if len(row) > 3 else 0,
+        "alerts_triggered": row[4] if len(row) > 4 else 0,
+        "username": row[5] if len(row) > 5 else None,
+        "first_name": row[6] if len(row) > 6 else None
     }
 
 def update_profile(user_id, **kwargs):
@@ -228,14 +231,19 @@ def send_and_track(chat_id, text, markup=None):
         track_message(chat_id, sent.message_id)
     return sent
 
-def clear_message(chat_id, msg_id):
+def clear_old_message(chat_id, msg_id):
     try:
         bot.delete_message(chat_id, msg_id)
     except:
         pass
 
+def back_button():
+    kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return kb
+
 # =========================
-# API FUNCTIONS
+# API FUNCTIONS (static)
 # =========================
 def get_price(symbol):
     try:
@@ -301,13 +309,14 @@ def get_multi_prices(symbol):
         return None
 
 def scan_contract(address):
+    """Returns (result_dict, error_message). result_dict is None if error."""
     if not address:
         return None, "Empty address"
     addr = re.sub(r"\s+", "", address)
     if len(addr) > MAX_CA_LENGTH:
         return None, "Address too long"
     addr_lower = addr.lower()
-    # Try GoPlusLabs (EVM chains)
+    # Try GoPlusLabs for EVM chains
     try:
         if re.match(r"^0x[a-f0-9]{40}$", addr_lower):
             for chain in [1, 56]:  # Ethereum, BSC
@@ -324,7 +333,7 @@ def scan_contract(address):
                     continue
             return None, "Contract not found on Ethereum or BSC (GoPlusLabs)."
         else:
-            # Solana
+            # Solana (optional, but keep)
             sol_addr = re.sub(r"[^a-zA-Z0-9]", "", addr)
             if len(sol_addr) < 32 or len(sol_addr) > 44:
                 return None, "Invalid Solana address."
@@ -337,7 +346,7 @@ def scan_contract(address):
                     return result, None
             return None, "Solana contract not found (GoPlusLabs)."
     except Exception as e:
-        log.error(f"Scanner error: {e}")
+        log.error(f"Scanner fatal: {e}")
         return None, f"Scanner error: {str(e)[:100]}"
 
 # =========================
@@ -362,12 +371,13 @@ def get_alert_count(uid):
 def check_alerts_for_symbol(uid, cid, symbol, current_price):
     rows = db_query("SELECT id, coin, target, direction FROM alerts WHERE user_id=? AND chat_id=? AND active=1 AND coin=?", (uid, cid, symbol.upper()), fetch_all=True)
     triggered = []
-    for aid, coin, target, direction in rows:
-        hit = (direction == ">" and current_price >= target) or (direction == "<" and current_price <= target)
-        if hit:
-            deactivate_alert(aid)
-            triggered.append((coin, direction, target))
-            db_query("UPDATE profiles SET alerts_triggered = alerts_triggered + 1 WHERE user_id=?", (uid,))
+    if rows:
+        for aid, coin, target, direction in rows:
+            hit = (direction == ">" and current_price >= target) or (direction == "<" and current_price <= target)
+            if hit:
+                deactivate_alert(aid)
+                triggered.append((coin, direction, target))
+                db_query("UPDATE profiles SET alerts_triggered = alerts_triggered + 1 WHERE user_id=?", (uid,))
     return triggered
 
 # =========================
@@ -476,13 +486,8 @@ def scan_menu():
     text = "🛡 <b>Contract Scanner</b>\n\nSend a contract address (EVM or Solana).\n\nUse /scan <address>"
     return text, InlineKeyboardMarkup().row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
 
-def back_button():
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-    return kb
-
 # =========================
-# CALLBACK HANDLERS (for inline menus)
+# CALLBACK HANDLERS
 # =========================
 waiting = {}
 wait_lock = threading.RLock()
@@ -492,8 +497,7 @@ def back_main_cb(call):
     cid = call.message.chat.id
     with wait_lock:
         waiting.pop((cid, call.from_user.id), None)
-    # Delete the old button message (it will be removed from queue eventually, but we can delete it now to avoid clutter)
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     text, kb = main_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -501,7 +505,7 @@ def back_main_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_price")
 def menu_price_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     text, kb = price_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -509,7 +513,7 @@ def menu_price_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_info")
 def menu_info_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     text, kb = info_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -517,7 +521,7 @@ def menu_info_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_multi")
 def menu_multi_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     text, kb = multi_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -525,7 +529,7 @@ def menu_multi_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_gainers")
 def menu_gainers_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     g, _ = get_top_movers(10)
     if not g:
         text = "❌ No gainers data available."
@@ -540,7 +544,7 @@ def menu_gainers_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_losers")
 def menu_losers_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     _, l = get_top_movers(10)
     if not l:
         text = "❌ No losers data available."
@@ -555,7 +559,7 @@ def menu_losers_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_alerts")
 def menu_alerts_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     text, kb = alerts_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -563,7 +567,7 @@ def menu_alerts_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "menu_scan")
 def menu_scan_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     text, kb = scan_menu()
     send_and_track(cid, text, kb)
     bot.answer_callback_query(call.id)
@@ -571,7 +575,7 @@ def menu_scan_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "profile")
 def profile_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     uid = call.from_user.id
     p = get_profile(uid)
     text = (f"👤 <b>Your Profile</b>\n\n"
@@ -586,14 +590,13 @@ def profile_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def price_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     price, change = get_price(symbol)
     if price is None:
         text = f"❌ Could not fetch price for {symbol}"
     else:
         text = f"💰 <b>{symbol}</b>\n{fmt_price(price)} ({change:+.2f}%)"
-        # Check alerts (optional, but keeps consistency)
         triggered = check_alerts_for_symbol(call.from_user.id, cid, symbol, price)
         for coin, direction, target in triggered:
             text += f"\n\n🚨 Alert triggered: {coin} {direction} {target:,.2f}"
@@ -603,7 +606,7 @@ def price_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
 def info_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     info = get_coin_info(symbol)
     if not info:
@@ -625,7 +628,7 @@ def info_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("multi_"))
 def multi_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     prices = get_multi_prices(symbol)
     if not prices:
@@ -643,7 +646,7 @@ def multi_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("setalert_"))
 def set_alert_preset_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     parts = call.data.split("_")
     if len(parts) < 4:
         bot.answer_callback_query(call.id, "Invalid alert format")
@@ -667,7 +670,7 @@ def set_alert_preset_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "custom_alert")
 def custom_alert_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     uid = call.from_user.id
     with wait_lock:
         waiting[(cid, uid)] = "custom_alert"
@@ -678,7 +681,7 @@ def custom_alert_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data == "list_alerts")
 def list_alerts_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     uid = call.from_user.id
     rows = db_query("SELECT id, coin, target, direction FROM alerts WHERE user_id=? AND chat_id=? AND active=1", (uid, cid), fetch_all=True)
     if not rows:
@@ -694,7 +697,7 @@ def list_alerts_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
 def search_cb(call):
     cid = call.message.chat.id
-    clear_message(cid, call.message.message_id)
+    clear_old_message(cid, call.message.message_id)
     mode = call.data.split("_")[1]  # price, info, multi
     uid = call.from_user.id
     with wait_lock:
@@ -716,8 +719,7 @@ def text_handler(m):
         state = waiting.pop((cid, uid), None)
     if not state:
         return
-    # Track this user message (it's part of the conversation)
-    track_message(cid, m.message_id)
+    track_message(cid, m.message_id)  # user's response message
     if state == "custom_alert":
         pattern = r"^(\w+)\s*([<>])\s*([\d.]+)$"
         match = re.match(pattern, m.text.strip().upper())
@@ -735,7 +737,7 @@ def text_handler(m):
             send_and_track(cid, err, back_button())
         else:
             send_and_track(cid, f"✅ Alert set for {coin} {direction} {target:,.2f}", back_button())
-        # Return to alerts menu
+        # Back to alerts menu
         text, kb = alerts_menu()
         send_and_track(cid, text, kb)
         return
@@ -782,10 +784,10 @@ def text_handler(m):
         send_and_track(cid, text, back_button())
 
 # =========================
-# COMMAND HANDLERS (fallback for direct commands)
+# SLASH COMMAND HANDLERS (as fallback)
 # =========================
 @bot.message_handler(commands=["start", "help"])
-def start_cmd(m):
+def cmd_start(m):
     if maintenance_block(m.from_user.id, m.chat.id):
         return
     track_message(m.chat.id, m.message_id)
@@ -794,20 +796,28 @@ def start_cmd(m):
     send_and_track(m.chat.id, text, kb)
 
 @bot.message_handler(commands=["cancel"])
-def cancel_cmd(m):
+def cmd_cancel(m):
     track_message(m.chat.id, m.message_id)
     cid = m.chat.id
     uid = m.from_user.id
     with wait_lock:
-        had_state = waiting.pop((cid, uid), None)
-    if had_state:
-        send_and_track(cid, "❌ Cancelled.", back_button())
-    else:
-        send_and_track(cid, "Nothing to cancel.", back_button())
+        if (cid, uid) in waiting:
+            del waiting[(cid, uid)]
+            send_and_track(cid, "❌ Cancelled.", back_button())
+        else:
+            send_and_track(cid, "Nothing to cancel.", back_button())
+
+@bot.message_handler(commands=["ping"])
+def cmd_ping(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
+    track_message(m.chat.id, m.message_id)
+    send_and_track(m.chat.id, "🏓 Pong! Bot is alive.", back_button())
 
 @bot.message_handler(commands=["price"])
-def price_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_price(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
@@ -816,13 +826,18 @@ def price_command(m):
     sym = args[1].upper()
     price, change = get_price(sym)
     if price is None:
-        send_and_track(m.chat.id, f"❌ No price for {sym}", back_button())
+        send_and_track(m.chat.id, f"❌ Could not fetch price for {sym}", back_button())
     else:
-        send_and_track(m.chat.id, f"💰 {sym}: {fmt_price(price)} ({change:+.2f}%)", back_button())
+        text = f"💰 {sym}: {fmt_price(price)} ({change:+.2f}%)"
+        triggered = check_alerts_for_symbol(m.from_user.id, m.chat.id, sym, price)
+        for coin, direction, target in triggered:
+            text += f"\n\n🚨 Alert triggered: {coin} {direction} {target:,.2f}"
+        send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["info"])
-def info_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_info(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
@@ -832,22 +847,23 @@ def info_command(m):
     info = get_coin_info(sym)
     if not info:
         send_and_track(m.chat.id, f"❌ No info for {sym}", back_button())
-    else:
-        text = (f"🔎 <b>{info['name']} ({info['symbol']})</b>\n"
-                f"🏆 Rank: #{info['rank']}\n"
-                f"💰 Price: {fmt_price(info['price'])}\n"
-                f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
-                f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
-                f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
-                f"📊 24h Volume: {fmt_price(info['volume'])}\n"
-                f"💎 Circulating Supply: {info['supply']:,.0f}")
-        if info['max_supply']:
-            text += f"\n🔒 Max Supply: {info['max_supply']:,.0f}"
-        send_and_track(m.chat.id, text, back_button())
+        return
+    text = (f"🔎 <b>{info['name']} ({info['symbol']})</b>\n"
+            f"🏆 Rank: #{info['rank']}\n"
+            f"💰 Price: {fmt_price(info['price'])}\n"
+            f"📈 ATH: {fmt_price(info['ath'])} ({info['ath_date']})\n"
+            f"📉 ATL: {fmt_price(info['atl'])} ({info['atl_date']})\n"
+            f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
+            f"📊 24h Volume: {fmt_price(info['volume'])}\n"
+            f"💎 Circulating Supply: {info['supply']:,.0f}")
+    if info['max_supply']:
+        text += f"\n🔒 Max Supply: {info['max_supply']:,.0f}"
+    send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["gainers"])
-def gainers_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_gainers(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     g, _ = get_top_movers(10)
     if not g:
@@ -860,8 +876,9 @@ def gainers_command(m):
     send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["losers"])
-def losers_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_losers(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     _, l = get_top_movers(10)
     if not l:
@@ -874,8 +891,9 @@ def losers_command(m):
     send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["multi"])
-def multi_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_multi(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
@@ -895,8 +913,9 @@ def multi_command(m):
     send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["alert"])
-def alert_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_alert(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) != 4:
@@ -907,7 +926,7 @@ def alert_command(m):
     try:
         target = float(args[3])
     except:
-        send_and_track(m.chat.id, "Invalid target", back_button())
+        send_and_track(m.chat.id, "Invalid target number", back_button())
         return
     if direction not in (">", "<"):
         send_and_track(m.chat.id, "Direction must be > or <", back_button())
@@ -919,8 +938,9 @@ def alert_command(m):
         send_and_track(m.chat.id, f"✅ Alert set: {coin} {direction} {target:,.2f}", back_button())
 
 @bot.message_handler(commands=["myalerts"])
-def myalerts_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_myalerts(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     rows = db_query("SELECT id, coin, target, direction FROM alerts WHERE user_id=? AND chat_id=? AND active=1", (m.from_user.id, m.chat.id), fetch_all=True)
     if not rows:
@@ -928,17 +948,18 @@ def myalerts_command(m):
         return
     text = "🔔 <b>Your alerts</b>\n\n"
     for aid, coin, target, direction in rows:
-        text += f"• {coin} {direction} {target:,.2f} (ID: {aid})\n"
+        text += f"• {coin} {direction} {target:,.2f}  (ID: {aid})\n"
     text += "\nUse /cancelalert <ID> to remove."
     send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["cancelalert"])
-def cancelalert_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_cancelalert(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) != 2:
-        send_and_track(m.chat.id, "Usage: /cancelalert <id>", back_button())
+        send_and_track(m.chat.id, "Usage: /cancelalert <alert_id>", back_button())
         return
     try:
         aid = int(args[1])
@@ -947,14 +968,15 @@ def cancelalert_command(m):
         return
     row = db_query("SELECT user_id FROM alerts WHERE id=?", (aid,), fetch_one=True)
     if not row or row[0] != m.from_user.id:
-        send_and_track(m.chat.id, "Not your alert", back_button())
+        send_and_track(m.chat.id, "Not your alert or not found", back_button())
         return
     deactivate_alert(aid)
     send_and_track(m.chat.id, "✅ Alert cancelled.", back_button())
 
 @bot.message_handler(commands=["scan"])
-def scan_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_scan(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
@@ -978,7 +1000,8 @@ def scan_command(m):
             pct = float(buy_tax) * 100
             if pct > 0:
                 flags.append(f"⚠️ Buy tax: {pct:.1f}%")
-        except: pass
+        except:
+            pass
     if flags:
         text += "<b>Risk flags:</b>\n" + "\n".join(flags) + "\n"
     else:
@@ -987,8 +1010,9 @@ def scan_command(m):
     send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["profile"])
-def profile_command(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
+def cmd_profile(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     p = get_profile(m.from_user.id)
     text = (f"👤 <b>Your Profile</b>\n\n"
@@ -999,18 +1023,13 @@ def profile_command(m):
             f"Active alerts: {get_alert_count(m.from_user.id)}")
     send_and_track(m.chat.id, text, back_button())
 
-@bot.message_handler(commands=["ping"])
-def ping_cmd(m):
-    if maintenance_block(m.from_user.id, m.chat.id): return
-    track_message(m.chat.id, m.message_id)
-    send_and_track(m.chat.id, "🏓 Pong! Bot is alive.", back_button())
-
 # =========================
 # ADMIN COMMANDS
 # =========================
 @bot.message_handler(commands=["users"])
-def users_cmd(m):
-    if not is_admin(m.from_user.id): return
+def cmd_users(m):
+    if not is_admin(m.from_user.id):
+        return
     track_message(m.chat.id, m.message_id)
     rows = db_query("SELECT username, first_name, join_date FROM profiles ORDER BY join_date DESC", fetch_all=True)
     if not rows:
@@ -1027,8 +1046,9 @@ def users_cmd(m):
         send_and_track(m.chat.id, text, back_button())
 
 @bot.message_handler(commands=["broadcast"])
-def broadcast_cmd(m):
-    if not is_admin(m.from_user.id): return
+def cmd_broadcast(m):
+    if not is_admin(m.from_user.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
@@ -1044,17 +1064,18 @@ def broadcast_cmd(m):
     send_and_track(m.chat.id, f"Broadcast sent to {sent} users.", back_button())
 
 @bot.message_handler(commands=["maintenance"])
-def maintenance_cmd(m):
-    if not is_admin(m.from_user.id): return
+def cmd_maintenance(m):
+    if not is_admin(m.from_user.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
         active, msg = get_maintenance()
-        send_and_track(m.chat.id, f"Maintenance: {'ON' if active else 'OFF'}\nMsg: {msg}", back_button())
+        send_and_track(m.chat.id, f"Maintenance: {'ON' if active else 'OFF'}\nMessage: {msg}", back_button())
         return
     sub = args[1].lower()
     if sub == "on":
-        set_maintenance(True, "Bot is under maintenance.")
+        set_maintenance(True, "Bot is under maintenance. Please try again later.")
         send_and_track(m.chat.id, "✅ Maintenance ENABLED", back_button())
     elif sub == "off":
         set_maintenance(False)
@@ -1063,13 +1084,14 @@ def maintenance_cmd(m):
         send_and_track(m.chat.id, "Usage: /maintenance on|off", back_button())
 
 @bot.message_handler(commands=["stats"])
-def stats_cmd(m):
-    if not is_admin(m.from_user.id): return
+def cmd_stats(m):
+    if not is_admin(m.from_user.id):
+        return
     track_message(m.chat.id, m.message_id)
     total_users = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
     total_alerts = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
     total_triggers = db_query("SELECT SUM(alerts_triggered) FROM profiles", fetch_one=True)[0] or 0
-    send_and_track(m.chat.id, f"📊 <b>Stats</b>\n\nUsers: {total_users}\nActive alerts: {total_alerts}\nTriggers: {total_triggers}", back_button())
+    send_and_track(m.chat.id, f"📊 <b>Bot Stats</b>\n\nUsers: {total_users}\nActive alerts: {total_alerts}\nTotal triggers: {total_triggers}", back_button())
 
 # =========================
 # SHUTDOWN
@@ -1088,7 +1110,7 @@ signal.signal(signal.SIGTERM, stop)
 # =========================
 # BOOT
 # =========================
-log.info("🚀 Persona Bot started – inline menus + working contract scanner, last 5 messages")
+log.info("🚀 Persona Bot started – solid version with inline menus and working CA scanner")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
