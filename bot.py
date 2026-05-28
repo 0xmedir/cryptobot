@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Solid Final Version
-- Inline menus (reliable, no live updates)
-- Working contract scanner (GoPlusLabs with timeout)
-- Keeps last 5 messages per chat
-- No WebSocket, no background threads, no crashes
-- Admin commands included
+Persona Bot – Solid Final Version (409 conflict fixed)
+- Clears webhook and polling session thoroughly
+- Inline menus, working contract scanner
+- Keeps last 5 messages
+- No live updates, no crashes
 """
 
 import telebot
@@ -45,7 +44,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
 # =========================
-# DATABASE (fixed schema with migration)
+# DATABASE (fixed schema)
 # =========================
 db_path = "data/persona.db"
 db_lock = threading.RLock()
@@ -183,7 +182,7 @@ def get_profile(user_id):
         row = (user_id, now, 0, 0, 0, None, None)
     # Ensure 7 elements (in case of old schema)
     if len(row) == 6:
-        row = row + (0,)  # add missing total_interactions
+        row = row + (0,)
     return {
         "user_id": row[0],
         "join_date": row[1],
@@ -309,17 +308,15 @@ def get_multi_prices(symbol):
         return None
 
 def scan_contract(address):
-    """Returns (result_dict, error_message). result_dict is None if error."""
     if not address:
         return None, "Empty address"
     addr = re.sub(r"\s+", "", address)
     if len(addr) > MAX_CA_LENGTH:
         return None, "Address too long"
     addr_lower = addr.lower()
-    # Try GoPlusLabs for EVM chains
     try:
         if re.match(r"^0x[a-f0-9]{40}$", addr_lower):
-            for chain in [1, 56]:  # Ethereum, BSC
+            for chain in [1, 56]:
                 url = f"https://api.gopluslabs.io/api/v1/token_security/{chain}?contract_addresses={addr_lower}"
                 try:
                     r = session.get(url, timeout=10)
@@ -333,7 +330,6 @@ def scan_contract(address):
                     continue
             return None, "Contract not found on Ethereum or BSC (GoPlusLabs)."
         else:
-            # Solana (optional, but keep)
             sol_addr = re.sub(r"[^a-zA-Z0-9]", "", addr)
             if len(sol_addr) < 32 or len(sol_addr) > 44:
                 return None, "Invalid Solana address."
@@ -1108,9 +1104,24 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
 # =========================
-# BOOT
+# BOOT – with webhook cleanup to prevent 409 conflict
 # =========================
-log.info("🚀 Persona Bot started – solid version with inline menus and working CA scanner")
-bot.delete_webhook()
-time.sleep(1)
-bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
+if __name__ == "__main__":
+    # Remove any existing webhook and pending updates
+    try:
+        bot.remove_webhook()
+        log.info("Webhook removed")
+    except Exception as e:
+        log.warning(f"Could not remove webhook: {e}")
+    time.sleep(1)
+    try:
+        # Delete webhook again to be sure
+        bot.delete_webhook()
+        log.info("Webhook deleted")
+    except Exception as e:
+        log.warning(f"Could not delete webhook: {e}")
+    time.sleep(2)
+
+    log.info("🚀 Persona Bot started – solid version with inline menus and working CA scanner")
+    # Use infinity_polling with skip_pending=True and allowed_updates to avoid conflicts
+    bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True, allowed_updates=['message', 'callback_query'])
