@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Stable Inline Menus (No 409 conflict)
-- Uses polling, not infinite polling
-- Removes webhook on start
-- Keeps last 5 messages per chat
-- Price, Info, Gainers, Losers, Multi-currency
+Persona Bot – Full Features (Stable)
+- Inline menus: price, info, gainers, losers, multi-currency, contract scanner
+- Keeps last 5 messages (user + bot + inline buttons)
+- Contract scanner (GoPlusLabs) with timeout
+- No database, no alerts, no WebSocket
 - Works on Termux and Railway
 """
 
@@ -23,7 +23,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    print("❌ BOT_TOKEN not set. Please export BOT_TOKEN=...")
+    print("❌ BOT_TOKEN not set")
     sys.exit(1)
 
 logging.basicConfig(level=logging.INFO)
@@ -36,7 +36,7 @@ os.makedirs("data", exist_ok=True)
 # REQUEST SESSION
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent": "PersonaBot/4.0"})
+session.headers.update({"User-Agent": "PersonaBot/5.0"})
 
 # =========================
 # HELPERS
@@ -80,8 +80,8 @@ def track_message(chat_id, msg_id):
             oldest = queue.pop(0)
             try:
                 bot.delete_message(chat_id, oldest)
-            except:
-                pass
+            except Exception as e:
+                log.debug(f"Could not delete message {oldest}: {e}")
 
 def send_and_track(chat_id, text, markup=None):
     sent = safe_send(chat_id, text, markup)
@@ -162,6 +162,48 @@ def get_multi_prices(symbol):
         return None
 
 # =========================
+# CONTRACT SCANNER (GoPlusLabs)
+# =========================
+def scan_contract(address):
+    if not address:
+        return None, "Empty address"
+    addr = re.sub(r"\s+", "", address)
+    if len(addr) > 100:
+        return None, "Address too long"
+    addr_lower = addr.lower()
+    # EVM (Ethereum/BSC)
+    if re.match(r"^0x[a-f0-9]{40}$", addr_lower):
+        for chain in [1, 56]:  # 1 = Ethereum, 56 = BSC
+            url = f"https://api.gopluslabs.io/api/v1/token_security/{chain}?contract_addresses={addr_lower}"
+            try:
+                r = session.get(url, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    result = data.get("result", {}).get(addr_lower, {})
+                    if result:
+                        return result, None
+            except Exception as e:
+                log.warning(f"GoPlus chain {chain} error: {e}")
+                continue
+        return None, "Contract not found (GoPlusLabs)."
+    else:
+        # Solana (optional)
+        sol_addr = re.sub(r"[^a-zA-Z0-9]", "", addr)
+        if len(sol_addr) < 32 or len(sol_addr) > 44:
+            return None, "Invalid Solana address."
+        url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={sol_addr}"
+        try:
+            r = session.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                result = data.get("result", {}).get(sol_addr, {})
+                if result:
+                    return result, None
+            return None, "Solana contract not found."
+        except Exception as e:
+            return None, f"Scanner error: {str(e)[:50]}"
+
+# =========================
 # INLINE MENUS
 # =========================
 def main_menu():
@@ -171,7 +213,8 @@ def main_menu():
            InlineKeyboardButton("🔎 Coin info", callback_data="menu_info"))
     kb.row(InlineKeyboardButton("📈 Gainers (top 10)", callback_data="menu_gainers"),
            InlineKeyboardButton("📉 Losers (top 10)", callback_data="menu_losers"))
-    kb.row(InlineKeyboardButton("💱 Currencies", callback_data="menu_multi"))
+    kb.row(InlineKeyboardButton("💱 Currencies", callback_data="menu_multi"),
+           InlineKeyboardButton("🛡 Scan CA", callback_data="menu_scan"))
     return text, kb
 
 def price_menu():
@@ -218,6 +261,10 @@ def multi_menu():
         kb.row(*row)
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
+
+def scan_menu():
+    text = "🛡 <b>Contract Scanner</b>\n\nSend a contract address (EVM or Solana).\n\nUse /scan <address>"
+    return text, back_button()
 
 # =========================
 # CALLBACK HANDLERS
@@ -284,6 +331,14 @@ def menu_losers_cb(call):
     send_and_track(cid, text, back_button())
     bot.answer_callback_query(call.id)
 
+@bot.callback_query_handler(func=lambda call: call.data == "menu_scan")
+def menu_scan_cb(call):
+    cid = call.message.chat.id
+    clear_old_message(cid, call.message.message_id)
+    text, kb = scan_menu()
+    send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def price_cb(call):
     cid = call.message.chat.id
@@ -334,7 +389,44 @@ def multi_cb(call):
     bot.answer_callback_query(call.id)
 
 # =========================
-# SLASH COMMANDS (fallback)
+# SCAN COMMAND (slash)
+# =========================
+@bot.message_handler(commands=["scan"])
+def cmd_scan(m):
+    track_message(m.chat.id, m.message_id)
+    args = m.text.split()
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /scan <contract_address>", back_button())
+        return
+    address = args[1]
+    result, err = scan_contract(address)
+    if err:
+        send_and_track(m.chat.id, f"❌ {err}", back_button())
+        return
+    text = "🛡 <b>Contract Security</b>\n\n"
+    text += f"<code>{address[:20]}...{address[-10:]}</code>\n\n"
+    risk_map = {"is_honeypot": "🍯 Honeypot", "is_mintable": "🖨 Mintable", "is_proxy": "🔀 Proxy", "is_blacklisted": "⛔ Blacklist"}
+    flags = []
+    for f, label in risk_map.items():
+        if str(result.get(f, "")) == "1":
+            flags.append(f"⚠️ {label}: YES")
+    buy_tax = result.get("buy_tax")
+    if buy_tax:
+        try:
+            pct = float(buy_tax) * 100
+            if pct > 0:
+                flags.append(f"⚠️ Buy tax: {pct:.1f}%")
+        except:
+            pass
+    if flags:
+        text += "<b>Risk flags:</b>\n" + "\n".join(flags) + "\n"
+    else:
+        text += "✅ No high‑risk flags detected.\n"
+    text += "\n🔗 <a href='https://gopluslabs.io/'>GoPlusLabs</a>"
+    send_and_track(m.chat.id, text, back_button())
+
+# =========================
+# OTHER SLASH COMMANDS (fallback)
 # =========================
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(m):
@@ -449,6 +541,5 @@ if __name__ == "__main__":
         print(f"Remove webhook failed: {e}")
     time.sleep(2)
 
-    print("🚀 Bot started – use /start for inline menus.")
-    # Use simple polling (not infinity_polling) to prevent 409 errors
+    print("🚀 Bot started – full features (price, info, gainers, losers, multi-currency, contract scanner, keep last 5 messages)")
     bot.polling(none_stop=True, interval=0, timeout=20)
