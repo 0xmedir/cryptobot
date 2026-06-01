@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Last 5 Messages Fixed (No immediate deletion)
-- All messages (user commands, bot replies, inline keyboards) are tracked.
-- FIFO queue deletes oldest when limit (5) exceeded.
-- No manual deletion – all handled automatically.
+Persona Bot – Final (Search in Price, Info, Currencies)
+- Search any coin in Price, Info, and Currencies menus
+- FIFO queue keeps last 5 messages (auto‑delete oldest)
+- All result messages are new messages; menus are edited in place
+- Admin commands, contract scanner, arrows, multi‑currency
 """
 
 import telebot
@@ -34,8 +35,11 @@ maintenance_mode = False
 maintenance_msg = ""
 
 session = requests.Session()
-session.headers.update({"User-Agent": "PersonaBot/7.0"})
+session.headers.update({"User-Agent": "PersonaBot/8.5"})
 
+# =========================
+# HELPERS
+# =========================
 def fmt_price(p):
     if p is None: return "N/A"
     if p >= 1: return f"${p:,.4f}"
@@ -80,14 +84,13 @@ def track_user(uid, username, first_name):
             user_stats[uid]["first_name"] = first_name
 
 # =========================
-# MESSAGE QUEUE – keep last 5 messages (auto‑delete oldest)
+# MESSAGE QUEUE – FIFO keeps last 5 messages
 # =========================
 message_queues = {}
 queue_lock = threading.RLock()
 MAX_CHAT_MESSAGES = 5
 
 def track_message(chat_id, msg_id):
-    """Add message to queue. If queue exceeds limit, delete the oldest."""
     with queue_lock:
         if chat_id not in message_queues:
             message_queues[chat_id] = []
@@ -97,7 +100,7 @@ def track_message(chat_id, msg_id):
             oldest = queue.pop(0)
             try:
                 bot.delete_message(chat_id, oldest)
-                log.info(f"Deleted message {oldest} in chat {chat_id} (queue size {len(queue)+1} > {MAX_CHAT_MESSAGES})")
+                log.info(f"Deleted {oldest} in {chat_id} (now {len(queue)} messages)")
             except Exception as e:
                 log.warning(f"Failed to delete {oldest}: {e}")
 
@@ -108,7 +111,6 @@ def send_and_track(chat_id, text, markup=None):
     return sent
 
 def edit_and_keep(chat_id, msg_id, text, markup=None):
-    """Edit a message (no new message ID, so queue unchanged)."""
     return safe_edit(chat_id, msg_id, text, markup)
 
 def back_button():
@@ -117,7 +119,7 @@ def back_button():
     return kb
 
 # =========================
-# API FUNCTIONS (same as before)
+# API FUNCTIONS
 # =========================
 def get_price(symbol):
     try:
@@ -215,7 +217,7 @@ def scan_contract(address):
             return None, f"Scanner error: {str(e)[:50]}"
 
 # =========================
-# INLINE MENUS (using edit to keep same message ID)
+# INLINE MENUS
 # =========================
 def main_menu():
     text = "⚡ <b>PERSONA</b>\n\nFast crypto tools: prices, alerts, intel."
@@ -229,7 +231,7 @@ def main_menu():
     return text, kb
 
 def price_menu():
-    text = "💵 <b>Price Check</b>\n\nTap a coin to see current price."
+    text = "💵 <b>Price Check</b>\n\nTap a coin or search."
     coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
     kb = InlineKeyboardMarkup()
     row = []
@@ -240,11 +242,12 @@ def price_menu():
             row = []
     if row:
         kb.row(*row)
+    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_price"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def info_menu():
-    text = "🔎 <b>Coin Info</b>\n\nPick a coin for market data."
+    text = "🔎 <b>Coin Info</b>\n\nPick a coin or search."
     coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"]
     kb = InlineKeyboardMarkup()
     row = []
@@ -255,11 +258,12 @@ def info_menu():
             row = []
     if row:
         kb.row(*row)
+    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_info"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
 def multi_menu():
-    text = "💱 <b>Currencies</b>\n\nSelect a coin for multi‑currency rates."
+    text = "💱 <b>Currencies</b>\n\nSelect a coin or search."
     coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "LINK"]
     kb = InlineKeyboardMarkup()
     row = []
@@ -270,6 +274,7 @@ def multi_menu():
             row = []
     if row:
         kb.row(*row)
+    kb.row(InlineKeyboardButton("🔍 Search any coin", callback_data="search_multi"))
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return text, kb
 
@@ -278,39 +283,40 @@ def scan_menu():
     return text, back_button()
 
 # =========================
-# CALLBACK HANDLERS (edit in place – no new message)
+# SEARCH STATE
+# =========================
+waiting = {}
+wait_lock = threading.RLock()
+
+# =========================
+# CALLBACK HANDLERS
 # =========================
 @bot.callback_query_handler(func=lambda call: call.data == "back_main")
 def back_main_cb(call):
-    cid = call.message.chat.id
     text, kb = main_menu()
-    edit_and_keep(cid, call.message.message_id, text, kb)
+    edit_and_keep(call.message.chat.id, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_price")
 def menu_price_cb(call):
-    cid = call.message.chat.id
     text, kb = price_menu()
-    edit_and_keep(cid, call.message.message_id, text, kb)
+    edit_and_keep(call.message.chat.id, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_info")
 def menu_info_cb(call):
-    cid = call.message.chat.id
     text, kb = info_menu()
-    edit_and_keep(cid, call.message.message_id, text, kb)
+    edit_and_keep(call.message.chat.id, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_multi")
 def menu_multi_cb(call):
-    cid = call.message.chat.id
     text, kb = multi_menu()
-    edit_and_keep(cid, call.message.message_id, text, kb)
+    edit_and_keep(call.message.chat.id, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_gainers")
 def menu_gainers_cb(call):
-    cid = call.message.chat.id
     g, _ = get_top_movers(10)
     if not g:
         text = "❌ No gainers data available."
@@ -319,12 +325,11 @@ def menu_gainers_cb(call):
         for d in g:
             coin = d["symbol"].removesuffix("USDT")
             text += f"🟢 <b>{coin}</b>  ▲ {float(d['priceChangePercent']):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
-    edit_and_keep(cid, call.message.message_id, text, back_button())
+    edit_and_keep(call.message.chat.id, call.message.message_id, text, back_button())
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_losers")
 def menu_losers_cb(call):
-    cid = call.message.chat.id
     _, l = get_top_movers(10)
     if not l:
         text = "❌ No losers data available."
@@ -333,19 +338,17 @@ def menu_losers_cb(call):
         for d in l:
             coin = d["symbol"].removesuffix("USDT")
             text += f"🔴 <b>{coin}</b>  ▼ {abs(float(d['priceChangePercent'])):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
-    edit_and_keep(cid, call.message.message_id, text, back_button())
+    edit_and_keep(call.message.chat.id, call.message.message_id, text, back_button())
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_scan")
 def menu_scan_cb(call):
-    cid = call.message.chat.id
     text, kb = scan_menu()
-    edit_and_keep(cid, call.message.message_id, text, kb)
+    edit_and_keep(call.message.chat.id, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def price_cb(call):
-    cid = call.message.chat.id
     symbol = call.data.split("_")[1]
     price, change = get_price(symbol)
     if price is None:
@@ -353,13 +356,11 @@ def price_cb(call):
     else:
         arrow = "🟢▲" if change >= 0 else "🔴▼"
         text = f"💰 <b>{symbol}</b>\n{fmt_price(price)} {arrow} {abs(change):.2f}%"
-    # Send a new message for price result (so that it appears in chat history)
-    send_and_track(cid, text, back_button())
+    send_and_track(call.message.chat.id, text, back_button())
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
 def info_cb(call):
-    cid = call.message.chat.id
     symbol = call.data.split("_")[1]
     info = get_coin_info(symbol)
     if not info:
@@ -371,12 +372,11 @@ def info_cb(call):
                 f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
                 f"📊 24h Volume: {fmt_price(info['volume'])}\n"
                 f"💎 Circulating Supply: {info['supply']:,.0f}")
-    send_and_track(cid, text, back_button())
+    send_and_track(call.message.chat.id, text, back_button())
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("multi_"))
 def multi_cb(call):
-    cid = call.message.chat.id
     symbol = call.data.split("_")[1]
     prices = get_multi_prices(symbol)
     if not prices:
@@ -388,11 +388,79 @@ def multi_cb(call):
             val = prices.get(code)
             if val is not None:
                 text += f"{name}: {fmt_currency_value(code, val)}\n"
+    send_and_track(call.message.chat.id, text, back_button())
+    bot.answer_callback_query(call.id)
+
+# =========================
+# SEARCH CALLBACKS
+# =========================
+@bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
+def search_cb(call):
+    mode = call.data.split("_")[1]  # price, info, multi
+    cid = call.message.chat.id
+    uid = call.from_user.id
+    with wait_lock:
+        waiting[(cid, uid)] = f"search_{mode}"
+    text = "🔍 Send the coin symbol (e.g., BTC, PEPE).\nSend /cancel to abort."
     send_and_track(cid, text, back_button())
     bot.answer_callback_query(call.id)
 
 # =========================
-# ADMIN COMMANDS (unchanged, but they already track)
+# TEXT HANDLER (for search and custom alert)
+# =========================
+@bot.message_handler(func=lambda m: True)
+def text_handler(m):
+    if m.text and m.text.startswith("/"):
+        return
+    cid = m.chat.id
+    uid = m.from_user.id
+    with wait_lock:
+        state = waiting.pop((cid, uid), None)
+    if not state:
+        return
+
+    # track the user's search message
+    track_message(cid, m.message_id)
+
+    if state.startswith("search_"):
+        mode = state.split("_")[1]
+        symbol = m.text.strip().upper()
+        if mode == "price":
+            price, change = get_price(symbol)
+            if price is None:
+                text = f"❌ Could not fetch price for {symbol}"
+            else:
+                arrow = "🟢▲" if change >= 0 else "🔴▼"
+                text = f"💰 <b>{symbol}</b>\n{fmt_price(price)} {arrow} {abs(change):.2f}%"
+        elif mode == "info":
+            info = get_coin_info(symbol)
+            if not info:
+                text = f"❌ No info found for {symbol}"
+            else:
+                text = (f"🔎 <b>{info['name']} ({info['symbol']})</b>\n"
+                        f"🏆 Rank: #{info['rank']}\n"
+                        f"💰 Price: {fmt_price(info['price'])}\n"
+                        f"🏦 Market Cap: {fmt_price(info['market_cap'])}\n"
+                        f"📊 24h Volume: {fmt_price(info['volume'])}\n"
+                        f"💎 Circulating Supply: {info['supply']:,.0f}")
+        elif mode == "multi":
+            prices = get_multi_prices(symbol)
+            if not prices:
+                text = f"❌ Failed to fetch multi‑currency data for {symbol}"
+            else:
+                order = [("usd","USD"),("eur","EUR"),("gbp","GBP"),("jpy","JPY"),("cny","CNY"),("aed","AED"),("try","TRY"),("inr","INR"),("krw","KRW"),("cad","CAD"),("aud","AUD")]
+                text = f"💱 <b>{symbol} – Currencies</b>\n\n"
+                for code, name in order:
+                    val = prices.get(code)
+                    if val is not None:
+                        text += f"{name}: {fmt_currency_value(code, val)}\n"
+        else:
+            return
+        send_and_track(cid, text, back_button())
+        return
+
+# =========================
+# ADMIN COMMANDS
 # =========================
 @bot.message_handler(commands=["users"])
 def cmd_users(m):
@@ -475,7 +543,7 @@ def maintenance_block(uid, cid):
     return False
 
 # =========================
-# SLASH COMMANDS
+# SCAN COMMAND (slash)
 # =========================
 @bot.message_handler(commands=["scan"])
 def cmd_scan(m):
@@ -513,6 +581,9 @@ def cmd_scan(m):
     text += "\n🔗 <a href='https://gopluslabs.io/'>GoPlusLabs</a>"
     send_and_track(m.chat.id, text, back_button())
 
+# =========================
+# OTHER SLASH COMMANDS
+# =========================
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(m):
     if maintenance_block(m.from_user.id, m.chat.id):
@@ -520,7 +591,6 @@ def cmd_start(m):
     track_message(m.chat.id, m.message_id)
     track_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
     text, kb = main_menu()
-    # Send a new message for the menu (so that it becomes part of the history)
     send_and_track(m.chat.id, text, kb)
 
 @bot.message_handler(commands=["price"])
@@ -615,6 +685,21 @@ def cmd_multi(m):
     send_and_track(m.chat.id, text, back_button())
 
 # =========================
+# CANCEL COMMAND (to exit search)
+# =========================
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(m):
+    track_message(m.chat.id, m.message_id)
+    cid = m.chat.id
+    uid = m.from_user.id
+    with wait_lock:
+        if (cid, uid) in waiting:
+            del waiting[(cid, uid)]
+            send_and_track(cid, "❌ Cancelled.", back_button())
+        else:
+            send_and_track(cid, "Nothing to cancel.", back_button())
+
+# =========================
 # SHUTDOWN
 # =========================
 def stop(sig, frame):
@@ -629,6 +714,9 @@ import signal
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
+# =========================
+# MAIN
+# =========================
 if __name__ == "__main__":
     try:
         bot.remove_webhook()
@@ -637,5 +725,5 @@ if __name__ == "__main__":
         print(f"Remove webhook failed: {e}")
     time.sleep(2)
 
-    print("🚀 Bot started – last 5 messages kept (auto-delete oldest)")
+    print("🚀 Bot started – search in Price, Info, Currencies; FIFO last 5 messages")
     bot.polling(none_stop=True, interval=0, timeout=20)
