@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final (Fixed global syntax)
-- Price with 🟢▲ / 🔴▼ arrows
-- Admin commands: /users, /stats, /broadcast, /maintenance
-- Contract scanner (GoPlusLabs)
-- Keeps last 5 messages
+Persona Bot – Last 5 Messages Fixed (No immediate deletion)
+- All messages (user commands, bot replies, inline keyboards) are tracked.
+- FIFO queue deletes oldest when limit (5) exceeded.
+- No manual deletion – all handled automatically.
 """
 
 import telebot
@@ -17,9 +16,6 @@ import re
 import logging
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# =========================
-# CONFIG
-# =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN not set")
@@ -33,20 +29,13 @@ log = logging.getLogger("PersonaBot")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 os.makedirs("data", exist_ok=True)
 
-# In-memory user tracking
 user_stats = {}
 maintenance_mode = False
 maintenance_msg = ""
 
-# =========================
-# REQUEST SESSION
-# =========================
 session = requests.Session()
-session.headers.update({"User-Agent": "PersonaBot/6.1"})
+session.headers.update({"User-Agent": "PersonaBot/7.0"})
 
-# =========================
-# HELPERS
-# =========================
 def fmt_price(p):
     if p is None: return "N/A"
     if p >= 1: return f"${p:,.4f}"
@@ -69,6 +58,14 @@ def safe_send(chat_id, text, markup=None):
         log.error(f"Send error: {e}")
         return None
 
+def safe_edit(chat_id, msg_id, text, markup=None):
+    try:
+        bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return True
+    except Exception as e:
+        log.warning(f"Edit error: {e}")
+        return False
+
 def is_admin(uid):
     return uid in ADMIN_IDS
 
@@ -83,13 +80,14 @@ def track_user(uid, username, first_name):
             user_stats[uid]["first_name"] = first_name
 
 # =========================
-# MESSAGE QUEUE – keep last 5 messages
+# MESSAGE QUEUE – keep last 5 messages (auto‑delete oldest)
 # =========================
 message_queues = {}
 queue_lock = threading.RLock()
 MAX_CHAT_MESSAGES = 5
 
 def track_message(chat_id, msg_id):
+    """Add message to queue. If queue exceeds limit, delete the oldest."""
     with queue_lock:
         if chat_id not in message_queues:
             message_queues[chat_id] = []
@@ -99,8 +97,9 @@ def track_message(chat_id, msg_id):
             oldest = queue.pop(0)
             try:
                 bot.delete_message(chat_id, oldest)
-            except:
-                pass
+                log.info(f"Deleted message {oldest} in chat {chat_id} (queue size {len(queue)+1} > {MAX_CHAT_MESSAGES})")
+            except Exception as e:
+                log.warning(f"Failed to delete {oldest}: {e}")
 
 def send_and_track(chat_id, text, markup=None):
     sent = safe_send(chat_id, text, markup)
@@ -108,11 +107,9 @@ def send_and_track(chat_id, text, markup=None):
         track_message(chat_id, sent.message_id)
     return sent
 
-def clear_old_message(chat_id, msg_id):
-    try:
-        bot.delete_message(chat_id, msg_id)
-    except:
-        pass
+def edit_and_keep(chat_id, msg_id, text, markup=None):
+    """Edit a message (no new message ID, so queue unchanged)."""
+    return safe_edit(chat_id, msg_id, text, markup)
 
 def back_button():
     kb = InlineKeyboardMarkup()
@@ -120,7 +117,7 @@ def back_button():
     return kb
 
 # =========================
-# API FUNCTIONS
+# API FUNCTIONS (same as before)
 # =========================
 def get_price(symbol):
     try:
@@ -180,9 +177,6 @@ def get_multi_prices(symbol):
     except:
         return None
 
-# =========================
-# CONTRACT SCANNER
-# =========================
 def scan_contract(address):
     if not address:
         return None, "Empty address"
@@ -221,7 +215,7 @@ def scan_contract(address):
             return None, f"Scanner error: {str(e)[:50]}"
 
 # =========================
-# INLINE MENUS
+# INLINE MENUS (using edit to keep same message ID)
 # =========================
 def main_menu():
     text = "⚡ <b>PERSONA</b>\n\nFast crypto tools: prices, alerts, intel."
@@ -284,44 +278,39 @@ def scan_menu():
     return text, back_button()
 
 # =========================
-# CALLBACK HANDLERS
+# CALLBACK HANDLERS (edit in place – no new message)
 # =========================
 @bot.callback_query_handler(func=lambda call: call.data == "back_main")
 def back_main_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     text, kb = main_menu()
-    send_and_track(cid, text, kb)
+    edit_and_keep(cid, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_price")
 def menu_price_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     text, kb = price_menu()
-    send_and_track(cid, text, kb)
+    edit_and_keep(cid, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_info")
 def menu_info_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     text, kb = info_menu()
-    send_and_track(cid, text, kb)
+    edit_and_keep(cid, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_multi")
 def menu_multi_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     text, kb = multi_menu()
-    send_and_track(cid, text, kb)
+    edit_and_keep(cid, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_gainers")
 def menu_gainers_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     g, _ = get_top_movers(10)
     if not g:
         text = "❌ No gainers data available."
@@ -330,13 +319,12 @@ def menu_gainers_cb(call):
         for d in g:
             coin = d["symbol"].removesuffix("USDT")
             text += f"🟢 <b>{coin}</b>  ▲ {float(d['priceChangePercent']):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
-    send_and_track(cid, text, back_button())
+    edit_and_keep(cid, call.message.message_id, text, back_button())
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_losers")
 def menu_losers_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     _, l = get_top_movers(10)
     if not l:
         text = "❌ No losers data available."
@@ -345,21 +333,19 @@ def menu_losers_cb(call):
         for d in l:
             coin = d["symbol"].removesuffix("USDT")
             text += f"🔴 <b>{coin}</b>  ▼ {abs(float(d['priceChangePercent'])):.2f}%  —  {fmt_price(float(d['lastPrice']))}\n"
-    send_and_track(cid, text, back_button())
+    edit_and_keep(cid, call.message.message_id, text, back_button())
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_scan")
 def menu_scan_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     text, kb = scan_menu()
-    send_and_track(cid, text, kb)
+    edit_and_keep(cid, call.message.message_id, text, kb)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def price_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     price, change = get_price(symbol)
     if price is None:
@@ -367,13 +353,13 @@ def price_cb(call):
     else:
         arrow = "🟢▲" if change >= 0 else "🔴▼"
         text = f"💰 <b>{symbol}</b>\n{fmt_price(price)} {arrow} {abs(change):.2f}%"
+    # Send a new message for price result (so that it appears in chat history)
     send_and_track(cid, text, back_button())
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
 def info_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     info = get_coin_info(symbol)
     if not info:
@@ -391,7 +377,6 @@ def info_cb(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("multi_"))
 def multi_cb(call):
     cid = call.message.chat.id
-    clear_old_message(cid, call.message.message_id)
     symbol = call.data.split("_")[1]
     prices = get_multi_prices(symbol)
     if not prices:
@@ -407,7 +392,7 @@ def multi_cb(call):
     bot.answer_callback_query(call.id)
 
 # =========================
-# ADMIN COMMANDS
+# ADMIN COMMANDS (unchanged, but they already track)
 # =========================
 @bot.message_handler(commands=["users"])
 def cmd_users(m):
@@ -458,7 +443,6 @@ def cmd_broadcast(m):
 def cmd_maintenance(m):
     if not is_admin(m.from_user.id):
         return
-    # Global declaration must be at the top of the function
     global maintenance_mode, maintenance_msg
     track_message(m.chat.id, m.message_id)
     args = m.text.split(maxsplit=1)
@@ -468,7 +452,6 @@ def cmd_maintenance(m):
         return
     sub = args[1].lower()
     if sub == "on":
-        # optional message after "on"
         parts = args[1].split(maxsplit=1)
         if len(parts) > 1:
             maintenance_msg = parts[1]
@@ -492,7 +475,7 @@ def maintenance_block(uid, cid):
     return False
 
 # =========================
-# SCAN COMMAND (slash)
+# SLASH COMMANDS
 # =========================
 @bot.message_handler(commands=["scan"])
 def cmd_scan(m):
@@ -530,9 +513,6 @@ def cmd_scan(m):
     text += "\n🔗 <a href='https://gopluslabs.io/'>GoPlusLabs</a>"
     send_and_track(m.chat.id, text, back_button())
 
-# =========================
-# OTHER SLASH COMMANDS
-# =========================
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(m):
     if maintenance_block(m.from_user.id, m.chat.id):
@@ -540,6 +520,7 @@ def cmd_start(m):
     track_message(m.chat.id, m.message_id)
     track_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
     text, kb = main_menu()
+    # Send a new message for the menu (so that it becomes part of the history)
     send_and_track(m.chat.id, text, kb)
 
 @bot.message_handler(commands=["price"])
@@ -648,9 +629,6 @@ import signal
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-# =========================
-# MAIN
-# =========================
 if __name__ == "__main__":
     try:
         bot.remove_webhook()
@@ -659,5 +637,5 @@ if __name__ == "__main__":
         print(f"Remove webhook failed: {e}")
     time.sleep(2)
 
-    print("🚀 Bot started – full features (admin commands, arrows, contract scanner, keep last 5 messages)")
+    print("🚀 Bot started – last 5 messages kept (auto-delete oldest)")
     bot.polling(none_stop=True, interval=0, timeout=20)
