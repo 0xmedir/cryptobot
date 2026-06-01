@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Full Features (Stable)
-- Inline menus: price, info, gainers, losers, multi-currency, contract scanner
-- Keeps last 5 messages (user + bot + inline buttons)
-- Contract scanner (GoPlusLabs) with timeout
-- No database, no alerts, no WebSocket
-- Works on Termux and Railway
+Persona Bot – Complete (Arrows, Admin Commands, Scanner)
+- Price with 🟢▲ / 🔴▼ arrows
+- Admin: /users, /stats, /broadcast, /maintenance
+- Contract scanner (GoPlusLabs)
+- Keeps last 5 messages
 """
 
 import telebot
@@ -26,17 +25,24 @@ if not BOT_TOKEN:
     print("❌ BOT_TOKEN not set")
     sys.exit(1)
 
+ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("PersonaBot")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 os.makedirs("data", exist_ok=True)
 
+# In-memory user tracking
+user_stats = {}
+maintenance_mode = False
+maintenance_msg = ""
+
 # =========================
 # REQUEST SESSION
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent": "PersonaBot/5.0"})
+session.headers.update({"User-Agent": "PersonaBot/6.0"})
 
 # =========================
 # HELPERS
@@ -63,6 +69,19 @@ def safe_send(chat_id, text, markup=None):
         log.error(f"Send error: {e}")
         return None
 
+def is_admin(uid):
+    return uid in ADMIN_IDS
+
+def track_user(uid, username, first_name):
+    if uid not in user_stats:
+        user_stats[uid] = {"join_date": time.time(), "interactions": 0, "username": username, "first_name": first_name}
+    else:
+        user_stats[uid]["interactions"] += 1
+        if username:
+            user_stats[uid]["username"] = username
+        if first_name:
+            user_stats[uid]["first_name"] = first_name
+
 # =========================
 # MESSAGE QUEUE – keep last 5 messages
 # =========================
@@ -80,8 +99,8 @@ def track_message(chat_id, msg_id):
             oldest = queue.pop(0)
             try:
                 bot.delete_message(chat_id, oldest)
-            except Exception as e:
-                log.debug(f"Could not delete message {oldest}: {e}")
+            except:
+                pass
 
 def send_and_track(chat_id, text, markup=None):
     sent = safe_send(chat_id, text, markup)
@@ -162,7 +181,7 @@ def get_multi_prices(symbol):
         return None
 
 # =========================
-# CONTRACT SCANNER (GoPlusLabs)
+# CONTRACT SCANNER
 # =========================
 def scan_contract(address):
     if not address:
@@ -171,9 +190,8 @@ def scan_contract(address):
     if len(addr) > 100:
         return None, "Address too long"
     addr_lower = addr.lower()
-    # EVM (Ethereum/BSC)
     if re.match(r"^0x[a-f0-9]{40}$", addr_lower):
-        for chain in [1, 56]:  # 1 = Ethereum, 56 = BSC
+        for chain in [1, 56]:
             url = f"https://api.gopluslabs.io/api/v1/token_security/{chain}?contract_addresses={addr_lower}"
             try:
                 r = session.get(url, timeout=10)
@@ -187,7 +205,6 @@ def scan_contract(address):
                 continue
         return None, "Contract not found (GoPlusLabs)."
     else:
-        # Solana (optional)
         sol_addr = re.sub(r"[^a-zA-Z0-9]", "", addr)
         if len(sol_addr) < 32 or len(sol_addr) > 44:
             return None, "Invalid Solana address."
@@ -348,7 +365,8 @@ def price_cb(call):
     if price is None:
         text = f"❌ Could not fetch price for {symbol}"
     else:
-        text = f"💰 <b>{symbol}</b>\n{fmt_price(price)} ({change:+.2f}%)"
+        arrow = "🟢▲" if change >= 0 else "🔴▼"
+        text = f"💰 <b>{symbol}</b>\n{fmt_price(price)} {arrow} {abs(change):.2f}%"
     send_and_track(cid, text, back_button())
     bot.answer_callback_query(call.id)
 
@@ -389,10 +407,90 @@ def multi_cb(call):
     bot.answer_callback_query(call.id)
 
 # =========================
+# ADMIN COMMANDS
+# =========================
+@bot.message_handler(commands=["users"])
+def cmd_users(m):
+    if not is_admin(m.from_user.id):
+        return
+    track_message(m.chat.id, m.message_id)
+    if not user_stats:
+        send_and_track(m.chat.id, "No users yet.", back_button())
+        return
+    text = "👥 <b>User List</b>\n\n"
+    for uid, data in user_stats.items():
+        name = f"{data.get('first_name', '?')}" + (f" (@{data.get('username', '')})" if data.get('username') else "")
+        joined = time.strftime("%Y-%m-%d", time.localtime(data['join_date']))
+        text += f"• {name}\n  ID: {uid}\n  Joined: {joined}\n\n"
+        if len(text) > 3900:
+            send_and_track(m.chat.id, text)
+            text = ""
+    if text:
+        send_and_track(m.chat.id, text, back_button())
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(m):
+    if not is_admin(m.from_user.id):
+        return
+    track_message(m.chat.id, m.message_id)
+    total_users = len(user_stats)
+    total_interactions = sum(data.get("interactions", 0) for data in user_stats.values())
+    send_and_track(m.chat.id, f"📊 <b>Bot Stats</b>\n\nUsers: {total_users}\nTotal interactions: {total_interactions}", back_button())
+
+@bot.message_handler(commands=["broadcast"])
+def cmd_broadcast(m):
+    if not is_admin(m.from_user.id):
+        return
+    track_message(m.chat.id, m.message_id)
+    args = m.text.split(maxsplit=1)
+    if len(args) < 2:
+        send_and_track(m.chat.id, "Usage: /broadcast <message>", back_button())
+        return
+    msg = args[1]
+    sent = 0
+    for uid in user_stats.keys():
+        if safe_send(uid, msg):
+            sent += 1
+        time.sleep(0.05)
+    send_and_track(m.chat.id, f"Broadcast sent to {sent} users.", back_button())
+
+@bot.message_handler(commands=["maintenance"])
+def cmd_maintenance(m):
+    if not is_admin(m.from_user.id):
+        return
+    track_message(m.chat.id, m.message_id)
+    args = m.text.split(maxsplit=1)
+    if len(args) < 2:
+        status = "ON" if maintenance_mode else "OFF"
+        send_and_track(m.chat.id, f"Maintenance mode: {status}\nMessage: {maintenance_msg}", back_button())
+        return
+    sub = args[1].lower()
+    global maintenance_mode, maintenance_msg
+    if sub == "on":
+        maintenance_mode = True
+        maintenance_msg = args[2] if len(args) > 2 else "Bot is under maintenance."
+        send_and_track(m.chat.id, "✅ Maintenance mode ENABLED", back_button())
+    elif sub == "off":
+        maintenance_mode = False
+        send_and_track(m.chat.id, "✅ Maintenance mode DISABLED", back_button())
+    else:
+        send_and_track(m.chat.id, "Usage: /maintenance on|off [message]", back_button())
+
+def maintenance_block(uid, cid):
+    if is_admin(uid):
+        return False
+    if maintenance_mode:
+        safe_send(cid, f"🔧 <b>Bot Under Maintenance</b>\n\n{maintenance_msg}")
+        return True
+    return False
+
+# =========================
 # SCAN COMMAND (slash)
 # =========================
 @bot.message_handler(commands=["scan"])
 def cmd_scan(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
@@ -426,16 +524,21 @@ def cmd_scan(m):
     send_and_track(m.chat.id, text, back_button())
 
 # =========================
-# OTHER SLASH COMMANDS (fallback)
+# OTHER SLASH COMMANDS
 # =========================
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
+    track_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
     text, kb = main_menu()
     send_and_track(m.chat.id, text, kb)
 
 @bot.message_handler(commands=["price"])
 def cmd_price(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
@@ -446,10 +549,13 @@ def cmd_price(m):
     if price is None:
         send_and_track(m.chat.id, f"❌ Could not fetch price for {sym}", back_button())
     else:
-        send_and_track(m.chat.id, f"💰 {sym}: {fmt_price(price)} ({change:+.2f}%)", back_button())
+        arrow = "🟢▲" if change >= 0 else "🔴▼"
+        send_and_track(m.chat.id, f"💰 {sym}: {fmt_price(price)} {arrow} {abs(change):.2f}%", back_button())
 
 @bot.message_handler(commands=["info"])
 def cmd_info(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
@@ -470,6 +576,8 @@ def cmd_info(m):
 
 @bot.message_handler(commands=["gainers"])
 def cmd_gainers(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     g, _ = get_top_movers(10)
     if not g:
@@ -483,6 +591,8 @@ def cmd_gainers(m):
 
 @bot.message_handler(commands=["losers"])
 def cmd_losers(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     _, l = get_top_movers(10)
     if not l:
@@ -496,6 +606,8 @@ def cmd_losers(m):
 
 @bot.message_handler(commands=["multi"])
 def cmd_multi(m):
+    if maintenance_block(m.from_user.id, m.chat.id):
+        return
     track_message(m.chat.id, m.message_id)
     args = m.text.split()
     if len(args) < 2:
@@ -515,7 +627,7 @@ def cmd_multi(m):
     send_and_track(m.chat.id, text, back_button())
 
 # =========================
-# SHUTDOWN HANDLER
+# SHUTDOWN
 # =========================
 def stop(sig, frame):
     log.info("Shutting down...")
@@ -530,10 +642,9 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
 # =========================
-# MAIN – POLLING (NO CONFLICT)
+# MAIN
 # =========================
 if __name__ == "__main__":
-    # Remove webhook to avoid 409 conflict
     try:
         bot.remove_webhook()
         print("Webhook removed.")
@@ -541,5 +652,5 @@ if __name__ == "__main__":
         print(f"Remove webhook failed: {e}")
     time.sleep(2)
 
-    print("🚀 Bot started – full features (price, info, gainers, losers, multi-currency, contract scanner, keep last 5 messages)")
+    print("🚀 Bot started – full features (admin commands, arrows, contract scanner, keep last 5 messages)")
     bot.polling(none_stop=True, interval=0, timeout=20)
