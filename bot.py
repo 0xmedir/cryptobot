@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Complete (Arrows, Admin Commands, Scanner)
+Persona Bot – Final (Fixed global syntax)
 - Price with 🟢▲ / 🔴▼ arrows
-- Admin: /users, /stats, /broadcast, /maintenance
+- Admin commands: /users, /stats, /broadcast, /maintenance
 - Contract scanner (GoPlusLabs)
 - Keeps last 5 messages
 """
@@ -42,7 +42,7 @@ maintenance_msg = ""
 # REQUEST SESSION
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent": "PersonaBot/6.0"})
+session.headers.update({"User-Agent": "PersonaBot/6.1"})
 
 # =========================
 # HELPERS
@@ -458,6 +458,8 @@ def cmd_broadcast(m):
 def cmd_maintenance(m):
     if not is_admin(m.from_user.id):
         return
+    # Global declaration must be at the top of the function
+    global maintenance_mode, maintenance_msg
     track_message(m.chat.id, m.message_id)
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
@@ -465,16 +467,21 @@ def cmd_maintenance(m):
         send_and_track(m.chat.id, f"Maintenance mode: {status}\nMessage: {maintenance_msg}", back_button())
         return
     sub = args[1].lower()
-    global maintenance_mode, maintenance_msg
     if sub == "on":
+        # optional message after "on"
+        parts = args[1].split(maxsplit=1)
+        if len(parts) > 1:
+            maintenance_msg = parts[1]
+        else:
+            maintenance_msg = "Bot is under maintenance."
         maintenance_mode = True
-        maintenance_msg = args[2] if len(args) > 2 else "Bot is under maintenance."
         send_and_track(m.chat.id, "✅ Maintenance mode ENABLED", back_button())
     elif sub == "off":
         maintenance_mode = False
+        maintenance_msg = ""
         send_and_track(m.chat.id, "✅ Maintenance mode DISABLED", back_button())
     else:
-        send_and_track(m.chat.id, "Usage: /maintenance on|off [message]", back_button())
+        send_and_track(m.chat.id, "Usage: /maintenance on [message] | off", back_button())
 
 def maintenance_block(uid, cid):
     if is_admin(uid):
