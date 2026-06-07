@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final (Search in Price, Info, Currencies)
-- Search any coin in Price, Info, and Currencies menus
-- FIFO queue keeps last 5 messages (auto‑delete oldest)
-- All result messages are new messages; menus are edited in place
-- Admin commands, contract scanner, arrows, multi‑currency
+Persona Bot – Final (No timeouts, inline menus, search, FIFO, scanner)
+- infinity_polling with long timeouts
+- Search in Price, Info, Currencies
+- Contract scanner
+- Keeps last 5 messages
+- Admin commands
 """
 
 import telebot
@@ -17,6 +18,9 @@ import re
 import logging
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+# =========================
+# CONFIG
+# =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN not set")
@@ -30,12 +34,13 @@ log = logging.getLogger("PersonaBot")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 os.makedirs("data", exist_ok=True)
 
+# In-memory user tracking
 user_stats = {}
 maintenance_mode = False
 maintenance_msg = ""
 
 session = requests.Session()
-session.headers.update({"User-Agent": "PersonaBot/8.5"})
+session.headers.update({"User-Agent": "PersonaBot/9.0"})
 
 # =========================
 # HELPERS
@@ -217,7 +222,7 @@ def scan_contract(address):
             return None, f"Scanner error: {str(e)[:50]}"
 
 # =========================
-# INLINE MENUS
+# INLINE MENUS (with Search)
 # =========================
 def main_menu():
     text = "⚡ <b>PERSONA</b>\n\nFast crypto tools: prices, alerts, intel."
@@ -406,7 +411,7 @@ def search_cb(call):
     bot.answer_callback_query(call.id)
 
 # =========================
-# TEXT HANDLER (for search and custom alert)
+# TEXT HANDLER (for search)
 # =========================
 @bot.message_handler(func=lambda m: True)
 def text_handler(m):
@@ -593,6 +598,18 @@ def cmd_start(m):
     text, kb = main_menu()
     send_and_track(m.chat.id, text, kb)
 
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(m):
+    track_message(m.chat.id, m.message_id)
+    cid = m.chat.id
+    uid = m.from_user.id
+    with wait_lock:
+        if (cid, uid) in waiting:
+            del waiting[(cid, uid)]
+            send_and_track(cid, "❌ Cancelled.", back_button())
+        else:
+            send_and_track(cid, "Nothing to cancel.", back_button())
+
 @bot.message_handler(commands=["price"])
 def cmd_price(m):
     if maintenance_block(m.from_user.id, m.chat.id):
@@ -685,21 +702,6 @@ def cmd_multi(m):
     send_and_track(m.chat.id, text, back_button())
 
 # =========================
-# CANCEL COMMAND (to exit search)
-# =========================
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(m):
-    track_message(m.chat.id, m.message_id)
-    cid = m.chat.id
-    uid = m.from_user.id
-    with wait_lock:
-        if (cid, uid) in waiting:
-            del waiting[(cid, uid)]
-            send_and_track(cid, "❌ Cancelled.", back_button())
-        else:
-            send_and_track(cid, "Nothing to cancel.", back_button())
-
-# =========================
 # SHUTDOWN
 # =========================
 def stop(sig, frame):
@@ -715,7 +717,7 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
 # =========================
-# MAIN
+# MAIN – using infinity_polling with long timeouts to prevent ReadTimeout
 # =========================
 if __name__ == "__main__":
     try:
@@ -726,4 +728,5 @@ if __name__ == "__main__":
     time.sleep(2)
 
     print("🚀 Bot started – search in Price, Info, Currencies; FIFO last 5 messages")
-    bot.polling(none_stop=True, interval=0, timeout=20)
+    # Use infinity_polling with high timeouts to avoid ReadTimeout errors
+    bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True, allowed_updates=['message', 'callback_query'])
