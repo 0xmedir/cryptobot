@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Persona Bot – Final (No timeouts, inline menus, search, FIFO, scanner)
-- infinity_polling with long timeouts
-- Search in Price, Info, Currencies
-- Contract scanner
-- Keeps last 5 messages
+Persona Bot – Full Production Version
+- Inline menus, search, contract scanner
+- FIFO last 5 messages
 - Admin commands
+- No timeouts (infinity_polling with long timeouts)
 """
 
 import telebot
@@ -34,13 +33,13 @@ log = logging.getLogger("PersonaBot")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 os.makedirs("data", exist_ok=True)
 
-# In-memory user tracking
+# In-memory storage
 user_stats = {}
 maintenance_mode = False
 maintenance_msg = ""
 
 session = requests.Session()
-session.headers.update({"User-Agent": "PersonaBot/9.0"})
+session.headers.update({"User-Agent": "PersonaBot/10.0"})
 
 # =========================
 # HELPERS
@@ -424,7 +423,6 @@ def text_handler(m):
     if not state:
         return
 
-    # track the user's search message
     track_message(cid, m.message_id)
 
     if state.startswith("search_"):
@@ -717,7 +715,7 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
 # =========================
-# MAIN – using infinity_polling with long timeouts to prevent ReadTimeout
+# MAIN – infinity_polling with long timeouts
 # =========================
 if __name__ == "__main__":
     try:
@@ -727,6 +725,5 @@ if __name__ == "__main__":
         print(f"Remove webhook failed: {e}")
     time.sleep(2)
 
-    print("🚀 Bot started – search in Price, Info, Currencies; FIFO last 5 messages")
-    # Use infinity_polling with high timeouts to avoid ReadTimeout errors
+    print("🚀 Persona Bot started – full features, FIFO last 5 messages")
     bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True, allowed_updates=['message', 'callback_query'])
